@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { DayPicker, type DayContentProps } from "react-day-picker";
+import { DayButton as RdpDayButton, DayPicker, type DayButtonProps } from "react-day-picker";
 import { addDays, addMonths, eachDayOfInterval, endOfMonth, endOfWeek, format, getISODay, parseISO, startOfMonth, startOfWeek } from "date-fns";
 import { pl } from "date-fns/locale";
 import "react-day-picker/style.css";
@@ -174,23 +174,25 @@ export function CalendarPage() {
               formatWeekdayName: (weekday) => format(weekday, "EEEEE", { locale: pl })
             }}
             components={{
-              DayContent: (props: DayContentProps) => {
-                const iso = toIsoLocal(props.date);
+              DayButton: (props: DayButtonProps) => {
+                const iso = toIsoLocal(props.day.date);
                 const snap = snapshotMap.get(iso);
                 return (
-                  <div className="calendar-day-content">
-                    <div className="cell-top">
-                      <strong>{format(props.date, "d")}</strong>
-                      {snap?.day ? <span className="mini-tag">D{snap.day.numerDnia}</span> : null}
+                  <RdpDayButton {...props}>
+                    <div className="calendar-day-content">
+                      <div className="cell-top">
+                        <strong>{format(props.day.date, "d")}</strong>
+                        {snap?.day ? <span className="mini-tag">D{snap.day.numerDnia}</span> : null}
+                      </div>
+                      <span className="day-cycle-label">{getWeekCycleDayLabel(props.day.date)}</span>
+                      <span className="mini-status">{snap?.progress ?? 0}%</span>
+                      <div className="cell-marks">
+                        {snap?.dayLog?.notatka ? <span className="mark">N</span> : null}
+                        {snap?.dayLog?.logiOdstepstw?.length ? <span className="mark">O</span> : null}
+                        {typeof snap?.dayLog?.wagaKg === "number" ? <span className="mark">W</span> : null}
+                      </div>
                     </div>
-                    <span className="day-cycle-label">{getWeekCycleDayLabel(props.date)}</span>
-                    <span className="mini-status">{snap?.progress ?? 0}%</span>
-                    <div className="cell-marks">
-                      {snap?.dayLog?.notatka ? <span className="mark">N</span> : null}
-                      {snap?.dayLog?.logiOdstepstw?.length ? <span className="mark">O</span> : null}
-                      {typeof snap?.dayLog?.wagaKg === "number" ? <span className="mark">W</span> : null}
-                    </div>
-                  </div>
+                  </RdpDayButton>
                 );
               }
             }}

@@ -26,10 +26,10 @@ function openDb(): Promise<IDBDatabase> {
       resolve(request.result);
     };
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
       const db = request.result;
       const tx = request.transaction;
-      const oldVersion = request.oldVersion;
+      const oldVersion = event.oldVersion;
 
       if (!db.objectStoreNames.contains(STORE.META)) {
         db.createObjectStore(STORE.META, { keyPath: "key" });
