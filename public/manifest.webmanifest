@@ -1,0 +1,28 @@
+{
+  "id": "./",
+  "name": "Planer Diety",
+  "short_name": "Dieta",
+  "description": "Prywatny planer diety i zakupów",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#f5f3ea",
+  "theme_color": "#1f6f5f",
+  "lang": "pl",
+  "icons": [
+    {
+      "src": "./icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
