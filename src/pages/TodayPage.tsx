@@ -7,8 +7,6 @@ import {
   getShoppingManualItems,
   getShoppingStates,
   saveDayNote,
-  saveDayWeight,
-  setDayDeviationFlag,
   setMealStatus
 } from "../db/repository";
 import { useApp } from "../context/AppContext";
@@ -29,7 +27,6 @@ export function TodayPage() {
   const [missingItems, setMissingItems] = useState<string[]>([]);
   const [missingCount, setMissingCount] = useState(0);
   const [noteDraft, setNoteDraft] = useState("");
-  const [weightDraft, setWeightDraft] = useState("");
   const [actionInfo, setActionInfo] = useState("");
 
   const day = useMemo(() => {
@@ -81,7 +78,6 @@ export function TodayPage() {
       setMealLogs(logs.filter((it) => it.dzienDietyId === day.id || !it.dzienDietyId));
       setDayLog(currentDayLog);
       setNoteDraft(currentDayLog?.notatka ?? "");
-      setWeightDraft(typeof currentDayLog?.wagaKg === "number" ? String(currentDayLog.wagaKg) : "");
 
       const aggregated = aggregateShoppingItems([day], listKey, shoppingStates, manualRows, inventoryResult.rows);
       const missing = aggregated.filter((item) => item.brakuje);
@@ -146,17 +142,6 @@ export function TodayPage() {
 
   const saveNote = async () => {
     await saveDayNote(today, day.id, day.numerDnia, noteDraft);
-    await load();
-  };
-
-  const toggleDeviation = async () => {
-    await setDayDeviationFlag(today, day.id, day.numerDnia, status !== "odstepstwo");
-    await load();
-  };
-
-  const saveWeight = async () => {
-    const parsed = weightDraft.trim() ? Number(weightDraft) : undefined;
-    await saveDayWeight(today, day.id, day.numerDnia, Number.isFinite(parsed as number) ? parsed : undefined);
     await load();
   };
 

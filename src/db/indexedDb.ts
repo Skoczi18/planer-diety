@@ -54,7 +54,7 @@ function attachDbLifecycle(db: IDBDatabase) {
 }
 
 function openDbInternal(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  return new Promise<IDBDatabase>((resolve, reject) => {
     const attemptId = ++globalState.openAttemptSeq;
     const WARN_TIMEOUT_MS = 8000;
     const HARD_TIMEOUT_MS = 30000;
