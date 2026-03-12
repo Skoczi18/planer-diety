@@ -44,9 +44,12 @@ export function InventoryPage() {
   const [expiry, setExpiry] = useState("");
   const [adjustAmounts, setAdjustAmounts] = useState<Record<string, number>>({});
 
-  const load = async () => {
-    setLoading(true);
-    setError("");
+  const load = async (options?: { silent?: boolean }) => {
+    const silent = !!options?.silent;
+    if (!silent) {
+      setLoading(true);
+      setError("");
+    }
     try {
       const rows = await getInventoryItems();
       setItems(rows);
@@ -54,7 +57,7 @@ export function InventoryPage() {
       console.error(err);
       setError("Nie udało się wczytać magazynu.");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -109,12 +112,12 @@ export function InventoryPage() {
     setLocation("spizarnia");
     setNote("");
     setExpiry("");
-    await load();
+    await load({ silent: true });
   };
 
   const quickAdjust = async (item: InventoryItemRecord, delta: number) => {
     await addInventoryAmount(item.productKey, item.jednostka, delta, item.nazwa);
-    await load();
+    await load({ silent: true });
   };
 
   const getAdjustAmount = (itemId: string): number => {
@@ -132,7 +135,7 @@ export function InventoryPage() {
 
   const clearItem = async (id: string) => {
     await removeInventoryItem(id);
-    await load();
+    await load({ silent: true });
   };
 
   const toggleGroup = (groupId: ShoppingGroup) => {
