@@ -10,6 +10,7 @@ export function AppShell({ children }: PropsWithChildren) {
   if (path === "/") title = "Dzisiaj";
   else if (path.startsWith("/dieta")) title = "Plan tygodnia";
   else if (path.startsWith("/zakupy")) title = "Zakupy";
+  else if (path.startsWith("/magazyn")) title = "Magazyn";
   else if (path.startsWith("/kalendarz")) title = "Kalendarz realizacji";
   else if (path.startsWith("/ustawienia")) title = "Ustawienia";
 

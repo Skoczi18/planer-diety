@@ -1,35 +1,127 @@
 import { DB_NAME, DB_VERSION, STORE } from "./schema";
 
-let dbPromise: Promise<IDBDatabase> | null = null;
+type GlobalDbState = {
+  db: IDBDatabase | null;
+  openPromise: Promise<IDBDatabase> | null;
+  openAttemptSeq: number;
+};
 
-function openDb(): Promise<IDBDatabase> {
-  if (dbPromise) return dbPromise;
+declare global {
+  interface Window {
+    __planerDietyDbState__?: GlobalDbState;
+  }
+}
 
-  dbPromise = new Promise((resolve, reject) => {
+const globalState: GlobalDbState =
+  window.__planerDietyDbState__ ??
+  (window.__planerDietyDbState__ = {
+    db: null,
+    openPromise: null,
+    openAttemptSeq: 0
+  });
+
+const REQUIRED_STORES = Object.values(STORE);
+
+function resetOpenPromise() {
+  globalState.openPromise = null;
+}
+
+function hasRequiredStores(db: IDBDatabase): boolean {
+  return REQUIRED_STORES.every((storeName) => db.objectStoreNames.contains(storeName));
+}
+
+function attachDbLifecycle(db: IDBDatabase) {
+  db.onversionchange = () => {
+    console.warn("[DB] versionchange received, closing stale connection");
+    try {
+      db.close();
+    } catch {
+      // no-op
+    }
+    if (globalState.db === db) {
+      globalState.db = null;
+      resetOpenPromise();
+    }
+  };
+
+  db.onclose = () => {
+    console.info("[DB] connection closed");
+    if (globalState.db === db) {
+      globalState.db = null;
+      resetOpenPromise();
+    }
+  };
+}
+
+function openDbInternal(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const attemptId = ++globalState.openAttemptSeq;
+    const WARN_TIMEOUT_MS = 8000;
+    const HARD_TIMEOUT_MS = 30000;
+    let blockedSeen = false;
+    console.info(`[DB][open#${attemptId}] start`, { name: DB_NAME, version: DB_VERSION });
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    const timeout = window.setTimeout(() => {
-      reject(new Error("Przekroczono czas oczekiwania na otwarcie lokalnej bazy danych."));
-    }, 8000);
+    let settled = false;
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(warnTimeout);
+      window.clearTimeout(hardTimeout);
+      console.info(`[DB][open#${attemptId}] timeout clear`);
+      fn();
+    };
+    console.info(`[DB][open#${attemptId}] warn timeout start`, { ms: WARN_TIMEOUT_MS });
+    const warnTimeout = window.setTimeout(() => {
+      if (settled) return;
+      console.warn(`[DB][open#${attemptId}] open takes longer than usual`);
+    }, WARN_TIMEOUT_MS);
+    const hardTimeout = window.setTimeout(() => {
+      if (settled) return;
+      const message = blockedSeen
+        ? "Otwarcie lokalnej bazy danych zostało zablokowane przez stare połączenie (timeout)."
+        : "Nie udało się otworzyć lokalnej bazy danych (timeout).";
+      done(() => reject(new Error(message)));
+    }, HARD_TIMEOUT_MS);
 
     request.onerror = () => {
-      window.clearTimeout(timeout);
-      reject(request.error);
+      console.error(`[DB][open#${attemptId}] error`, request.error);
+      done(() => reject(request.error));
     };
 
     request.onblocked = () => {
-      window.clearTimeout(timeout);
-      reject(new Error("Otwarcie bazy zostało zablokowane. Zamknij inne karty aplikacji i odśwież."));
+      blockedSeen = true;
+      console.error(`[DB][open#${attemptId}] blocked`);
+      if (globalState.db) {
+        console.warn(`[DB][open#${attemptId}] closing stale in-app connection`);
+        try {
+          globalState.db.close();
+        } catch {
+          // no-op
+        }
+      }
+      // Nie przerywamy natychmiast. Czekamy, czy po zamknięciu starego połączenia
+      // request dokończy się sukcesem.
     };
 
     request.onsuccess = () => {
-      window.clearTimeout(timeout);
-      resolve(request.result);
+      const db = request.result;
+      console.info(`[DB][open#${attemptId}] success`);
+      attachDbLifecycle(db);
+      globalState.db = db;
+      done(() => resolve(db));
     };
 
     request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
       const db = request.result;
       const tx = request.transaction;
       const oldVersion = event.oldVersion;
+      console.info(`[DB][open#${attemptId}] upgrade start`, { oldVersion, newVersion: DB_VERSION });
+
+      if (tx) {
+        tx.oncomplete = () => console.info(`[DB][open#${attemptId}] upgrade tx complete`);
+        tx.onabort = () => console.error(`[DB][open#${attemptId}] upgrade tx abort`, tx.error);
+        tx.onerror = () => console.error(`[DB][open#${attemptId}] upgrade tx error`, tx.error);
+      }
 
       if (!db.objectStoreNames.contains(STORE.META)) {
         db.createObjectStore(STORE.META, { keyPath: "key" });
@@ -64,6 +156,19 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE.PANTRY_ITEMS)) {
         db.createObjectStore(STORE.PANTRY_ITEMS, { keyPath: "id" });
       }
+      if (!db.objectStoreNames.contains(STORE.INVENTORY_CATALOG)) {
+        const store = db.createObjectStore(STORE.INVENTORY_CATALOG, { keyPath: "id" });
+        store.createIndex("by_product", "productKey", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE.INVENTORY_ITEMS)) {
+        const store = db.createObjectStore(STORE.INVENTORY_ITEMS, { keyPath: "id" });
+        store.createIndex("by_product", "productKey", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE.INVENTORY_OPERATIONS)) {
+        const store = db.createObjectStore(STORE.INVENTORY_OPERATIONS, { keyPath: "id" });
+        store.createIndex("by_date", "data", { unique: false });
+        store.createIndex("by_meal", "posilekId", { unique: false });
+      }
       if (!db.objectStoreNames.contains(STORE.SETTINGS)) {
         db.createObjectStore(STORE.SETTINGS, { keyPath: "key" });
       }
@@ -72,72 +177,49 @@ function openDb(): Promise<IDBDatabase> {
         store.createIndex("by_date", "data", { unique: false });
       }
 
-      if (oldVersion < 2 && tx && db.objectStoreNames.contains(STORE.DAY_STATUSES) && db.objectStoreNames.contains(STORE.DAY_LOGS)) {
-        const oldStore = tx.objectStore(STORE.DAY_STATUSES);
-        const newStore = tx.objectStore(STORE.DAY_LOGS);
-        const oldRequest = oldStore.getAll();
-
-        oldRequest.onsuccess = () => {
-          const rows = (oldRequest.result as Array<{ data: string; dzienDietyId: string; status: string }>) ?? [];
-          rows.forEach((row) => {
-            newStore.put({
-              id: row.data,
-              data: row.data,
-              dzienDietyId: row.dzienDietyId,
-              numerDniaDiety: 0,
-              statusManualny: row.status === "odstepstwo" ? "odstepstwo" : undefined,
-              logiOdstepstw: [],
-              updatedAt: new Date().toISOString()
-            });
-          });
-        };
+      if (oldVersion < 3) {
+        console.info(`[DB][open#${attemptId}] legacy migration skipped in upgrade tx`);
       }
 
-      if (oldVersion < 2 && tx && db.objectStoreNames.contains(STORE.MEAL_STATUSES) && db.objectStoreNames.contains(STORE.MEAL_LOGS)) {
-        const oldStore = tx.objectStore(STORE.MEAL_STATUSES);
-        const newStore = tx.objectStore(STORE.MEAL_LOGS);
-        const oldRequest = oldStore.getAll();
-
-        oldRequest.onsuccess = () => {
-          const rows = (oldRequest.result as Array<{ data: string; posilekId: string; zrealizowany: boolean }>) ?? [];
-          rows.forEach((row) => {
-            newStore.put({
-              id: `${row.data}::${row.posilekId}`,
-              data: row.data,
-              dzienDietyId: "",
-              posilekId: row.posilekId,
-              przygotowany: row.zrealizowany,
-              zjedzony: row.zrealizowany,
-              updatedAt: new Date().toISOString()
-            });
-          });
-        };
-      }
-
-      if (oldVersion < 3 && tx && db.objectStoreNames.contains(STORE.SHOPPING_STATES)) {
-        const store = tx.objectStore(STORE.SHOPPING_STATES);
-        const getAll = store.getAll();
-        getAll.onsuccess = () => {
-          const rows =
-            (getAll.result as Array<{ id: string; scope?: string; listKey?: string; itemKey?: string; productKey?: string; kupione: boolean; mamWDomu: boolean }>) ?? [];
-          rows.forEach((row) => {
-            const listKey = row.listKey ?? row.scope ?? "week:all";
-            const productKey = row.productKey ?? row.itemKey ?? "unknown";
-            store.put({
-              id: `${listKey}::${productKey}`,
-              listKey,
-              productKey,
-              kupione: !!row.kupione,
-              mamWDomu: !!row.mamWDomu
-            });
-          });
-        };
-      }
+      console.info(`[DB][open#${attemptId}] upgrade done`);
     };
+  }).catch((error) => {
+    resetOpenPromise();
+    throw error;
   });
+}
 
-  return dbPromise.catch((error) => {
-    dbPromise = null;
+function openDb(): Promise<IDBDatabase> {
+  if (globalState.db) {
+    if (!hasRequiredStores(globalState.db) || globalState.db.version !== DB_VERSION) {
+      console.warn("[DB] stale connection detected, forcing reopen", {
+        currentVersion: globalState.db.version,
+        expectedVersion: DB_VERSION
+      });
+      try {
+        globalState.db.close();
+      } catch {
+        // no-op
+      }
+      globalState.db = null;
+      resetOpenPromise();
+    }
+  }
+
+  if (globalState.db) {
+    console.info("[DB] reuse existing connection");
+    return Promise.resolve(globalState.db);
+  }
+
+  if (globalState.openPromise) {
+    console.info("[DB] await existing open promise");
+    return globalState.openPromise;
+  }
+
+  globalState.openPromise = openDbInternal();
+
+  return globalState.openPromise.catch((error) => {
+    resetOpenPromise();
     throw error;
   });
 }
@@ -147,30 +229,49 @@ export async function runTransaction<T>(
   mode: IDBTransactionMode,
   action: (store: IDBObjectStore) => Promise<T>
 ): Promise<T> {
-  const db = await openDb();
+  let db = await openDb();
 
-  return new Promise<T>((resolve, reject) => {
-    const tx = db.transaction(storeName, mode);
-    const store = tx.objectStore(storeName);
-    let result: T;
+  const run = (database: IDBDatabase) =>
+    new Promise<T>((resolve, reject) => {
+      const tx = database.transaction(storeName, mode);
+      const store = tx.objectStore(storeName);
+      let result: T;
 
-    tx.oncomplete = () => resolve(result);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
 
-    action(store)
-      .then((value) => {
-        result = value;
-      })
-      .catch((err) => {
-        reject(err);
-        try {
-          tx.abort();
-        } catch {
-          // no-op
-        }
-      });
-  });
+      action(store)
+        .then((value) => {
+          result = value;
+        })
+        .catch((err) => {
+          reject(err);
+          try {
+            tx.abort();
+          } catch {
+            // no-op
+          }
+        });
+    });
+
+  try {
+    return await run(db);
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "NotFoundError") {
+      console.warn("[DB] store not found in current connection, retry after reopen", { storeName });
+      try {
+        db.close();
+      } catch {
+        // no-op
+      }
+      globalState.db = null;
+      resetOpenPromise();
+      db = await openDb();
+      return run(db);
+    }
+    throw err;
+  }
 }
 
 export function reqToPromise<T>(request: IDBRequest<T>): Promise<T> {

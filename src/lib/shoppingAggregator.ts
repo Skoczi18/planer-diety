@@ -1,5 +1,6 @@
-import { DzienDiety, ShoppingFilter, ShoppingGroup, ShoppingManualItemRecord, ShoppingMode, SpizarniaItemRecord, StanZakupuRecord } from "../types";
-import { buildItemKey, normalizeProductName, normalizeUnit, resolveShoppingGroup } from "./shoppingNormalize";
+import { DzienDiety, InventoryItemRecord, ShoppingFilter, ShoppingGroup, ShoppingManualItemRecord, ShoppingMode, StanZakupuRecord } from "../types";
+import { buildItemKey, normalizeProductName, normalizeShoppingGroup, normalizeUnit, resolveShoppingGroup, splitIngredientNameToProducts } from "./shoppingNormalize";
+import { CATEGORY_LABELS } from "./productCategories";
 
 export type ShoppingSelection = {
   mode: ShoppingMode;
@@ -20,18 +21,12 @@ export type AggregatedShoppingItem = {
   kupione: boolean;
   mamWDomu: boolean;
   wSpizarni: boolean;
+  iloscWMagazynie: number;
+  brakujacaIlosc: number;
   brakuje: boolean;
 };
 
-export const GROUP_LABELS: Record<ShoppingGroup, string> = {
-  mieso: "Mięso",
-  nabial_i_jaja: "Nabiał i jaja",
-  pieczywo_i_zboza: "Pieczywo i zboża",
-  warzywa_i_owoce: "Warzywa i owoce",
-  tluszcze_i_dodatki: "Tłuszcze i dodatki",
-  przyprawy: "Przyprawy",
-  inne: "Inne"
-};
+export const GROUP_LABELS: Record<ShoppingGroup, string> = CATEGORY_LABELS;
 
 function daySortValue(dayId: string): number {
   const match = dayId.match(/\d+/);
@@ -72,39 +67,49 @@ export function aggregateShoppingItems(
   days: DzienDiety[],
   listKey: string,
   states: StanZakupuRecord[],
-  pantry: SpizarniaItemRecord[],
-  manualRows: ShoppingManualItemRecord[]
+  manualRows: ShoppingManualItemRecord[],
+  inventory: InventoryItemRecord[]
 ): AggregatedShoppingItem[] {
   const stateMap = new Map(states.map((it) => [`${it.listKey}::${it.productKey}`, it]));
-  const pantrySet = new Set(pantry.filter((it) => it.aktywny).map((it) => it.productKey));
+  const inventoryMap = new Map(inventory.map((it) => [it.id, it]));
 
   const map = new Map<string, AggregatedShoppingItem>();
 
   days.forEach((day) => {
     day.listaZakupow.forEach((item) => {
-      const normalized = normalizeProductName(item.nazwa);
-      const unit = normalizeUnit(item.jednostka);
-      const itemKey = buildItemKey(normalized.productKey, unit);
-      const stateKey = `${listKey}::${itemKey}`;
-      const currentState = stateMap.get(stateKey);
-      const wSpizarni = pantrySet.has(normalized.productKey);
-      const existing = map.get(itemKey);
+      const expandedNames = splitIngredientNameToProducts(item.nazwa);
+      const amountPerEntry = expandedNames.length > 1 ? item.ilosc / expandedNames.length : item.ilosc;
+      expandedNames.forEach((nameEntry) => {
+        const normalized = normalizeProductName(nameEntry);
+        const unit = normalizeUnit(item.jednostka);
+        const itemKey = buildItemKey(normalized.productKey, unit);
+        const stateKey = `${listKey}::${itemKey}`;
+        const currentState = stateMap.get(stateKey);
+        const inventoryAmount = inventoryMap.get(itemKey)?.ilosc ?? 0;
+        const existing = map.get(itemKey);
+        const requiredAmount = roundAmount((existing?.ilosc ?? 0) + amountPerEntry);
+        const effectiveInventory = inventoryAmount;
+        const missingAmount = roundAmount(Math.max(0, requiredAmount - effectiveInventory));
+        const hasEnough = missingAmount <= 0;
 
-      map.set(itemKey, {
-        itemKey,
-        productKey: normalized.productKey,
-        nazwa: normalized.canonicalName,
-        ilosc: roundAmount((existing?.ilosc ?? 0) + item.ilosc),
-        jednostka: unit,
-        grupa: resolveShoppingGroup(normalized.canonicalName),
-        sourceDayIds: [...new Set([...(existing?.sourceDayIds ?? []), day.id])],
-        sourceDayNumbers: [...new Set([...(existing?.sourceDayNumbers ?? []), day.numerDnia])].sort((a, b) => a - b),
-        notatka: existing?.notatka,
-        manual: existing?.manual ?? false,
-        kupione: currentState?.kupione ?? false,
-        mamWDomu: currentState?.mamWDomu ?? false,
-        wSpizarni,
-        brakuje: !(currentState?.kupione || currentState?.mamWDomu || wSpizarni)
+        map.set(itemKey, {
+          itemKey,
+          productKey: normalized.productKey,
+          nazwa: normalized.canonicalName,
+          ilosc: requiredAmount,
+          jednostka: unit,
+          grupa: resolveShoppingGroup(normalized.canonicalName),
+          sourceDayIds: [...new Set([...(existing?.sourceDayIds ?? []), day.id])],
+          sourceDayNumbers: [...new Set([...(existing?.sourceDayNumbers ?? []), day.numerDnia])].sort((a, b) => a - b),
+          notatka: existing?.notatka,
+          manual: existing?.manual ?? false,
+          kupione: currentState?.kupione ?? false,
+          mamWDomu: currentState ? currentState.mamWDomu : hasEnough,
+          wSpizarni: false,
+          iloscWMagazynie: effectiveInventory,
+          brakujacaIlosc: missingAmount,
+          brakuje: !hasEnough
+        });
       });
     });
   });
@@ -114,7 +119,7 @@ export function aggregateShoppingItems(
     const key = row.itemKey;
     const stateKey = `${listKey}::${key}`;
     const currentState = stateMap.get(stateKey);
-    const wSpizarni = pantrySet.has(row.productKey);
+    const inventoryAmount = inventoryMap.get(key)?.ilosc ?? 0;
 
     if (row.usuniety) {
       map.delete(key);
@@ -122,21 +127,27 @@ export function aggregateShoppingItems(
     }
 
     const base = map.get(key);
+    const requiredAmount = roundAmount(row.ilosc);
+    const effectiveInventory = inventoryAmount;
+    const missingAmount = roundAmount(Math.max(0, requiredAmount - effectiveInventory));
+    const hasEnough = missingAmount <= 0;
     map.set(key, {
       itemKey: key,
       productKey: row.productKey,
       nazwa: row.nazwa,
-      ilosc: roundAmount(row.ilosc),
+      ilosc: requiredAmount,
       jednostka: normalizeUnit(row.jednostka),
-      grupa: row.grupa ?? resolveShoppingGroup(row.nazwa),
+      grupa: normalizeShoppingGroup(row.grupa, row.nazwa),
       sourceDayIds: base?.sourceDayIds ?? [],
       sourceDayNumbers: base?.sourceDayNumbers ?? [],
       notatka: row.notatka,
       manual: true,
       kupione: currentState?.kupione ?? base?.kupione ?? false,
-      mamWDomu: currentState?.mamWDomu ?? base?.mamWDomu ?? false,
-      wSpizarni,
-      brakuje: !((currentState?.kupione ?? base?.kupione) || (currentState?.mamWDomu ?? base?.mamWDomu) || wSpizarni)
+      mamWDomu: currentState ? currentState.mamWDomu : hasEnough,
+      wSpizarni: false,
+      iloscWMagazynie: effectiveInventory,
+      brakujacaIlosc: missingAmount,
+      brakuje: !hasEnough
     });
   });
 
@@ -152,7 +163,7 @@ export function filterShoppingItems(items: AggregatedShoppingItem[], filter: Sho
     case "tylko_brakujace":
       return items.filter((item) => item.brakuje);
     case "tylko_nieodhaczone":
-      return items.filter((item) => !item.kupione && !item.mamWDomu);
+      return items.filter((item) => !item.kupione && item.brakuje);
     default:
       return items;
   }
@@ -160,12 +171,13 @@ export function filterShoppingItems(items: AggregatedShoppingItem[], filter: Sho
 
 export function groupShoppingItems(items: AggregatedShoppingItem[]): Array<{ group: ShoppingGroup; label: string; items: AggregatedShoppingItem[] }> {
   const order: ShoppingGroup[] = [
-    "mieso",
     "nabial_i_jaja",
+    "mieso_i_ryby",
     "pieczywo_i_zboza",
     "warzywa_i_owoce",
     "tluszcze_i_dodatki",
-    "przyprawy",
+    "przyprawy_i_dodatki_kuchenne",
+    "napoje_i_plyny",
     "inne"
   ];
 

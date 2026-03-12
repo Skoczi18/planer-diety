@@ -4,6 +4,7 @@ const items = [
   { to: "/", label: "Dzisiaj", icon: "◉" },
   { to: "/dieta", label: "Dieta", icon: "▦" },
   { to: "/zakupy", label: "Zakupy", icon: "✓" },
+  { to: "/magazyn", label: "Magazyn", icon: "▣" },
   { to: "/kalendarz", label: "Kalendarz", icon: "◷" },
   { to: "/ustawienia", label: "Ustawienia", icon: "☰" }
 ];

@@ -77,7 +77,27 @@ export type RealizacjaPosilkuRecord = {
   przygotowany: boolean;
   zjedzony: boolean;
   notatka?: string;
+  inventoryDeducted?: boolean;
+  inventoryDeductedAt?: string;
+  inventoryDeductionKey?: string;
+  inventoryDeductionInfo?: string;
+  inventoryOperationIds?: string[];
   updatedAt: string;
+};
+
+export type OperacjaMagazynuRecord = {
+  id: string;
+  data: string;
+  dzienDietyId: string;
+  posilekId: string;
+  inventoryDeductionKey: string;
+  skladnikNazwa: string;
+  productKey: string;
+  wymaganaIlosc: number;
+  odjetaIlosc: number;
+  jednostka: string;
+  createdAt: string;
+  notatka?: string;
 };
 
 export type ShoppingMode = "dzien" | "tydzien" | "wiele";
@@ -85,12 +105,13 @@ export type ShoppingMode = "dzien" | "tydzien" | "wiele";
 export type ShoppingFilter = "wszystko" | "ukryj_kupione" | "ukryj_mam" | "tylko_brakujace" | "tylko_nieodhaczone";
 
 export type ShoppingGroup =
-  | "mieso"
+  | "mieso_i_ryby"
   | "nabial_i_jaja"
   | "pieczywo_i_zboza"
   | "warzywa_i_owoce"
   | "tluszcze_i_dodatki"
-  | "przyprawy"
+  | "przyprawy_i_dodatki_kuchenne"
+  | "napoje_i_plyny"
   | "inne";
 
 export type StanZakupuRecord = {
@@ -105,6 +126,35 @@ export type SpizarniaItemRecord = {
   id: string;
   productKey: string;
   label: string;
+  aktywny: boolean;
+  updatedAt: string;
+};
+
+export type LokalizacjaMagazynu = "lodowka" | "spizarnia" | "zamrazarka" | "inne";
+
+export type InventoryItemRecord = {
+  id: string;
+  productKey: string;
+  nazwa: string;
+  ilosc: number;
+  jednostka: string;
+  grupa: ShoppingGroup;
+  lokalizacja: LokalizacjaMagazynu;
+  bazowyZPlanu: boolean;
+  source: "diet_base" | "manual";
+  notatka?: string;
+  dataWaznosci?: string;
+  updatedAt: string;
+};
+
+export type InventoryCatalogItemRecord = {
+  id: string;
+  productKey: string;
+  nazwa: string;
+  jednostka: string;
+  grupa: ShoppingGroup;
+  bazowyZPlanu: boolean;
+  source: "diet_base" | "manual";
   aktywny: boolean;
   updatedAt: string;
 };
@@ -152,6 +202,9 @@ export type ExportAplikacji = {
     mealLogs: RealizacjaPosilkuRecord[];
     shoppingStates: StanZakupuRecord[];
     pantryItems: SpizarniaItemRecord[];
+    inventoryCatalog?: InventoryCatalogItemRecord[];
+    inventoryItems: InventoryItemRecord[];
+    inventoryOperations?: OperacjaMagazynuRecord[];
     shoppingManualItems: ShoppingManualItemRecord[];
     settings: UstawieniaAplikacji[];
     notes: NotatkaRecord[];

@@ -1,4 +1,5 @@
-import { addDays, toISODate } from "./date";
+import { addDays as addDaysDateFns, format, parseISO, startOfWeek } from "date-fns";
+import { toISODate } from "./date";
 import { calculatePostepDnia, getAutoStatusDnia } from "./execution";
 import { DzienDiety, DzienRealizacjiRecord, RealizacjaPosilkuRecord, StatusDnia } from "../types";
 
@@ -47,12 +48,11 @@ export function buildDaySnapshot(date: string, day: DzienDiety | undefined, dayL
 }
 
 export function buildWeekSummary(anchorDate: string, snapshots: DaySnapshot[]): WeekSummary {
-  const day = new Date(`${anchorDate}T00:00:00`);
-  const dow = (day.getDay() + 6) % 7;
-  const from = addDays(anchorDate, -dow);
-  const to = addDays(from, 6);
-
-  const weekDates = Array.from({ length: 7 }, (_, idx) => addDays(from, idx));
+  const anchor = parseISO(anchorDate);
+  const monday = startOfWeek(anchor, { weekStartsOn: 1 });
+  const weekDates = Array.from({ length: 7 }, (_, idx) => format(addDaysDateFns(monday, idx), "yyyy-MM-dd"));
+  const from = weekDates[0];
+  const to = weekDates[6];
   const week = weekDates.map((date) => snapshots.find((s) => s.date === date)).filter(Boolean) as DaySnapshot[];
 
   const zrealizowane = week.filter((s) => s.status === "zrealizowany").length;

@@ -1,14 +1,22 @@
 import { SEED_DIETA } from "../data/seedDiet";
+import { BASE_INVENTORY_CATALOG } from "../data/baseInventoryProducts";
 import { toISODate } from "../lib/date";
-import { buildItemKey, normalizeProductName, normalizeUnit, resolveShoppingGroup } from "../lib/shoppingNormalize";
+import { buildItemKey, normalizeProductName, normalizeShoppingGroup, normalizeUnit, resolveShoppingGroup, splitIngredientNameToProducts } from "../lib/shoppingNormalize";
 import {
   DzienDiety,
   DzienRealizacjiRecord,
   ExportAplikacji,
+  InventoryCatalogItemRecord,
+  InventoryItemRecord,
+  LokalizacjaMagazynu,
   LogOdstepstwa,
   MetaRecord,
   NotatkaRecord,
+  OperacjaMagazynuRecord,
+  Posilek,
   RealizacjaPosilkuRecord,
+  ShoppingGroup,
+  Skladnik,
   ShoppingManualItemRecord,
   SpizarniaItemRecord,
   StanZakupuRecord,
@@ -50,6 +58,21 @@ type LegacyMealStatus = {
   updatedAt?: string;
 };
 
+export type OstrzezenieMagazynu = {
+  typ: "brak_produktu" | "brak_ilosci" | "nieobslugiwana_jednostka";
+  skladnikNazwa: string;
+  jednostka: string;
+  wymaganaIlosc: number;
+  dostepnaIlosc: number;
+};
+
+export type WynikPrzygotowaniaPosilku = {
+  status: "zapisano" | "wymaga_potwierdzenia";
+  ostrzezenia: OstrzezenieMagazynu[];
+  inventoryDeducted: boolean;
+  inventoryDeductionInfo?: string;
+};
+
 type LegacyDayStatus = {
   id: string;
   data: string;
@@ -67,6 +90,10 @@ type LegacyShoppingState = {
   mamWDomu: boolean;
 };
 
+function isMissingStoreError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "NotFoundError";
+}
+
 function normalizeSettings(settings: UstawieniaAplikacji | undefined): UstawieniaAplikacji {
   return {
     ...DEFAULT_SETTINGS,
@@ -83,8 +110,48 @@ function normalizeMealLog(log: Partial<RealizacjaPosilkuRecord> & { data: string
     przygotowany: !!log.przygotowany,
     zjedzony: !!log.zjedzony,
     notatka: log.notatka ?? "",
+    inventoryDeducted: !!log.inventoryDeducted,
+    inventoryDeductedAt: log.inventoryDeductedAt,
+    inventoryDeductionKey: log.inventoryDeductionKey,
+    inventoryDeductionInfo: log.inventoryDeductionInfo ?? "",
+    inventoryOperationIds: log.inventoryOperationIds ?? [],
     updatedAt: log.updatedAt ?? new Date().toISOString()
   };
+}
+
+function buildMealDeductionKey(day: DzienDiety, meal: Posilek): string {
+  return meal.partia?.id ? `${day.id}::${meal.partia.id}` : `${day.id}::${meal.id}`;
+}
+
+function isSupportedInventoryUnit(unit: string): boolean {
+  const normalized = normalizeUnit(unit);
+  return normalized === "g" || normalized === "ml" || normalized === "szt.";
+}
+
+function resolveIngredientsForDeduction(meal: Posilek): Skladnik[] {
+  const multiplier = meal.partia && meal.partia.indeksPorcji === 1 ? meal.partia.liczbaPorcji : 1;
+  const result: Skladnik[] = [];
+  meal.skladniki
+    .filter((item) => {
+      const normalizedName = normalizeProductName(item.nazwa);
+      return normalizedName.productKey !== "przyprawy" && normalizeUnit(item.jednostka) !== "porcja";
+    })
+    .forEach((item) => {
+      const expanded = splitIngredientNameToProducts(item.nazwa);
+      const baseAmount = item.ilosc * multiplier;
+      const perItemAmount = expanded.length > 1 ? baseAmount / expanded.length : baseAmount;
+      expanded.forEach((entry) => {
+        const normalizedEntry = normalizeProductName(entry);
+        result.push({
+          nazwa: normalizedEntry.canonicalName,
+          ilosc: perItemAmount,
+          jednostka: item.jednostka,
+          notatka: item.notatka
+        });
+      });
+    });
+
+  return result;
 }
 
 function normalizeDayLog(log: Partial<DzienRealizacjiRecord> & { data: string; dzienDietyId: string; numerDniaDiety: number }): DzienRealizacjiRecord {
@@ -117,6 +184,149 @@ function manualItemId(listKey: string, itemKey: string): string {
   return `${listKey}::${itemKey}`;
 }
 
+function inventoryId(productKey: string, unit: string): string {
+  return buildItemKey(productKey, unit);
+}
+
+function normalizeInventoryItem(item: Partial<InventoryItemRecord> & { nazwa: string; ilosc: number; jednostka: string }): InventoryItemRecord {
+  const normalized = normalizeProductName(item.nazwa);
+  const unit = normalizeUnit(item.jednostka);
+  const productKey = item.productKey ?? normalized.productKey;
+  const id = item.id ?? inventoryId(productKey, unit);
+
+  return {
+    id,
+    productKey,
+    nazwa: item.nazwa?.trim() ? item.nazwa : normalized.canonicalName,
+    ilosc: Number.isFinite(item.ilosc) ? Math.max(0, item.ilosc) : 0,
+    jednostka: unit,
+    grupa: normalizeShoppingGroup(item.grupa, item.nazwa ?? normalized.canonicalName),
+    lokalizacja: (item.lokalizacja as LokalizacjaMagazynu) ?? "spizarnia",
+    bazowyZPlanu: !!item.bazowyZPlanu,
+    source: item.source === "diet_base" ? "diet_base" : "manual",
+    notatka: item.notatka ?? "",
+    dataWaznosci: item.dataWaznosci,
+    updatedAt: item.updatedAt ?? new Date().toISOString()
+  };
+}
+
+function normalizeInventoryCatalogItem(item: InventoryCatalogItemRecord): InventoryCatalogItemRecord {
+  const normalized = normalizeProductName(item.nazwa);
+  const unit = normalizeUnit(item.jednostka);
+  return {
+    id: item.id ?? buildItemKey(normalized.productKey, unit),
+    productKey: item.productKey ?? normalized.productKey,
+    nazwa: item.nazwa || normalized.canonicalName,
+    jednostka: unit,
+    grupa: normalizeShoppingGroup(item.grupa, item.nazwa || normalized.canonicalName),
+    bazowyZPlanu: !!item.bazowyZPlanu,
+    source: item.source === "diet_base" ? "diet_base" : "manual",
+    aktywny: item.aktywny !== false,
+    updatedAt: item.updatedAt ?? new Date().toISOString()
+  };
+}
+
+async function seedBaseInventoryCatalog(): Promise<void> {
+  let existingCatalog: InventoryCatalogItemRecord[] = [];
+  try {
+    existingCatalog = await dbGetAll<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG);
+  } catch (error) {
+    if (isMissingStoreError(error)) {
+      console.warn("[DB] inventoryCatalog store not available during seed - skipping catalog writes in this run");
+    } else {
+      throw error;
+    }
+  }
+  const existingCatalogMap = new Map(existingCatalog.map((row) => [row.id, row]));
+  const existingInventory = await dbGetAll<InventoryItemRecord>(STORE.INVENTORY_ITEMS);
+  const existingInventoryMap = new Map(existingInventory.map((row) => [row.id, row]));
+
+  const catalogToPut: InventoryCatalogItemRecord[] = [];
+  const inventoryToPut: InventoryItemRecord[] = [];
+
+  BASE_INVENTORY_CATALOG.forEach((base) => {
+    if (!existingCatalogMap.has(base.id)) {
+      catalogToPut.push(normalizeInventoryCatalogItem(base));
+    }
+    const currentInventory = existingInventoryMap.get(base.id);
+    if (!currentInventory) {
+      inventoryToPut.push(
+        normalizeInventoryItem({
+          id: base.id,
+          productKey: base.productKey,
+          nazwa: base.nazwa,
+          ilosc: 0,
+          jednostka: base.jednostka,
+          grupa: base.grupa,
+          lokalizacja: "spizarnia",
+          bazowyZPlanu: true,
+          source: "diet_base",
+          updatedAt: new Date().toISOString()
+        })
+      );
+      return;
+    }
+
+    if (!currentInventory.bazowyZPlanu || currentInventory.source !== "diet_base") {
+      inventoryToPut.push(
+        normalizeInventoryItem({
+          ...currentInventory,
+          bazowyZPlanu: true,
+          source: "diet_base",
+          nazwa: currentInventory.nazwa || base.nazwa,
+          updatedAt: new Date().toISOString()
+        })
+      );
+    }
+  });
+
+  if (catalogToPut.length) {
+    try {
+      await dbBulkPut(STORE.INVENTORY_CATALOG, catalogToPut);
+    } catch (error) {
+      if (!isMissingStoreError(error)) throw error;
+      console.warn("[DB] inventoryCatalog store missing during bulk put - skipped");
+    }
+  }
+  if (inventoryToPut.length) await dbBulkPut(STORE.INVENTORY_ITEMS, inventoryToPut);
+}
+
+async function migrateInventoryCategoryValues(): Promise<void> {
+  const [inventoryRows, catalogRows, manualRows] = await Promise.all([
+    dbGetAll<InventoryItemRecord>(STORE.INVENTORY_ITEMS),
+    dbGetAll<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG).catch((error) => {
+      if (isMissingStoreError(error)) return [];
+      throw error;
+    }),
+    dbGetAll<ShoppingManualItemRecord>(STORE.SHOPPING_MANUAL_ITEMS)
+  ]);
+
+  const inventoryUpdates = inventoryRows
+    .map((row) => normalizeInventoryItem(row))
+    .filter((row, idx) => row.grupa !== inventoryRows[idx].grupa);
+
+  const catalogUpdates = catalogRows
+    .map((row) => normalizeInventoryCatalogItem(row))
+    .filter((row, idx) => row.grupa !== catalogRows[idx].grupa);
+
+  const manualUpdates = manualRows
+    .map((row) => ({
+      ...row,
+      grupa: normalizeShoppingGroup(row.grupa, row.nazwa)
+    }))
+    .filter((row, idx) => row.grupa !== manualRows[idx].grupa);
+
+  if (inventoryUpdates.length) await dbBulkPut(STORE.INVENTORY_ITEMS, inventoryUpdates);
+  if (catalogUpdates.length) {
+    try {
+      await dbBulkPut(STORE.INVENTORY_CATALOG, catalogUpdates);
+    } catch (error) {
+      if (!isMissingStoreError(error)) throw error;
+    }
+  }
+  if (manualUpdates.length) await dbBulkPut(STORE.SHOPPING_MANUAL_ITEMS, manualUpdates);
+}
+
 export async function initDatabaseWithSeed(): Promise<void> {
   const seeded = await dbGet<MetaRecord>(STORE.META, "seeded");
 
@@ -143,6 +353,17 @@ export async function initDatabaseWithSeed(): Promise<void> {
     await dbBulkPut(STORE.PANTRY_ITEMS, rows);
     await dbPut(STORE.META, { key: "pantrySeeded", value: "1" });
   }
+
+  const inventoryCatalogSeeded = await dbGet<MetaRecord>(STORE.META, "inventoryCatalogSeeded");
+  if (!inventoryCatalogSeeded?.value) {
+    await seedBaseInventoryCatalog();
+    await dbPut(STORE.META, { key: "inventoryCatalogSeeded", value: "1" });
+  } else {
+    // utrzymanie kompatybilności po zmianach katalogu bazowego
+    await seedBaseInventoryCatalog();
+  }
+
+  await migrateInventoryCategoryValues();
 }
 
 export async function getDietDays(): Promise<DzienDiety[]> {
@@ -270,18 +491,262 @@ export async function setMealStatus(
 ): Promise<void> {
   await upsertDayLog(data, dzienDietyId, numerDniaDiety);
   const id = mealLogId(data, posilekId);
-  const current = await dbGet<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, id);
+  const rawCurrent = await dbGet<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, id);
+  const current = rawCurrent ? normalizeMealLog(rawCurrent) : undefined;
+
+  const nextPrepared = patch.przygotowany ?? current?.przygotowany ?? false;
+  const nextEaten = patch.zjedzony ?? current?.zjedzony ?? false;
+
+  if (nextEaten && !nextPrepared) {
+    throw new Error("Nie można oznaczyć posiłku jako zjedzony przed przygotowaniem.");
+  }
 
   await dbPut<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, {
     id,
     data,
     dzienDietyId,
     posilekId,
-    przygotowany: patch.przygotowany ?? current?.przygotowany ?? false,
-    zjedzony: patch.zjedzony ?? current?.zjedzony ?? false,
+    przygotowany: nextPrepared,
+    zjedzony: nextEaten,
     notatka: patch.notatka ?? current?.notatka ?? "",
+    inventoryDeducted: current?.inventoryDeducted ?? false,
+    inventoryDeductedAt: current?.inventoryDeductedAt,
+    inventoryDeductionKey: current?.inventoryDeductionKey,
+    inventoryDeductionInfo: current?.inventoryDeductionInfo ?? "",
+    inventoryOperationIds: current?.inventoryOperationIds ?? [],
     updatedAt: new Date().toISOString()
   });
+}
+
+export async function setMealPreparedWithInventory(
+  data: string,
+  day: DzienDiety,
+  meal: Posilek,
+  prepared: boolean,
+  options?: { forceOnWarnings?: boolean }
+): Promise<WynikPrzygotowaniaPosilku> {
+  await upsertDayLog(data, day.id, day.numerDnia);
+  const id = mealLogId(data, meal.id);
+  const currentRaw = await dbGet<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, id);
+  const current = currentRaw ? normalizeMealLog(currentRaw) : undefined;
+
+  if (!prepared) {
+    await dbPut<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, {
+      id,
+      data,
+      dzienDietyId: day.id,
+      posilekId: meal.id,
+      przygotowany: false,
+      // Nie utrzymujemy stanu "zjedzony" bez "przygotowany".
+      zjedzony: false,
+      notatka: current?.notatka ?? "",
+      inventoryDeducted: current?.inventoryDeducted ?? false,
+      inventoryDeductedAt: current?.inventoryDeductedAt,
+      inventoryDeductionKey: current?.inventoryDeductionKey ?? buildMealDeductionKey(day, meal),
+      inventoryDeductionInfo:
+        current?.inventoryDeducted
+          ? "Składniki zostały już wcześniej odjęte z magazynu i nie są przywracane automatycznie."
+          : current?.inventoryDeductionInfo ?? "",
+      inventoryOperationIds: current?.inventoryOperationIds ?? [],
+      updatedAt: new Date().toISOString()
+    });
+    return {
+      status: "zapisano",
+      ostrzezenia: [],
+      inventoryDeducted: current?.inventoryDeducted ?? false,
+      inventoryDeductionInfo:
+        current?.inventoryDeducted
+          ? "Składniki zostały już wcześniej odjęte z magazynu i nie są przywracane automatycznie."
+          : undefined
+    };
+  }
+
+  const deductionKey = buildMealDeductionKey(day, meal);
+  const allLogsForDate = (await getMealLogsByDate(data))
+    .filter((it) => it.dzienDietyId === day.id || !it.dzienDietyId)
+    .map((it) => normalizeMealLog(it));
+
+  const sharedDeductedLog = allLogsForDate.find(
+    (it) => it.inventoryDeductionKey === deductionKey && it.inventoryDeducted && it.posilekId !== meal.id
+  );
+
+  if (meal.partia?.indeksPorcji === 2) {
+    await dbPut<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, {
+      id,
+      data,
+      dzienDietyId: day.id,
+      posilekId: meal.id,
+      przygotowany: true,
+      zjedzony: current?.zjedzony ?? false,
+      notatka: current?.notatka ?? "",
+      inventoryDeducted: false,
+      inventoryDeductedAt: sharedDeductedLog?.inventoryDeductedAt,
+      inventoryDeductionKey: deductionKey,
+      inventoryDeductionInfo: sharedDeductedLog
+        ? "Składniki zostały rozliczone przy wcześniejszym przygotowaniu pierwszej porcji."
+        : "To druga porcja z wcześniej przygotowanego dania. Magazyn nie jest odejmowany ponownie.",
+      inventoryOperationIds: sharedDeductedLog?.inventoryOperationIds ?? [],
+      updatedAt: new Date().toISOString()
+    });
+    return {
+      status: "zapisano",
+      ostrzezenia: [],
+      inventoryDeducted: false,
+      inventoryDeductionInfo: sharedDeductedLog
+        ? "Składniki zostały rozliczone przy wcześniejszym przygotowaniu pierwszej porcji."
+        : "To druga porcja z wcześniej przygotowanego dania. Magazyn nie jest odejmowany ponownie."
+    };
+  }
+
+  if (current?.inventoryDeducted) {
+    await dbPut<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, {
+      ...current,
+      przygotowany: true,
+      updatedAt: new Date().toISOString()
+    });
+    return {
+      status: "zapisano",
+      ostrzezenia: [],
+      inventoryDeducted: true,
+      inventoryDeductionInfo: "Składniki dla tego posiłku zostały już wcześniej odjęte z magazynu."
+    };
+  }
+
+  if (sharedDeductedLog) {
+    await dbPut<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, {
+      id,
+      data,
+      dzienDietyId: day.id,
+      posilekId: meal.id,
+      przygotowany: true,
+      zjedzony: current?.zjedzony ?? false,
+      notatka: current?.notatka ?? "",
+      inventoryDeducted: false,
+      inventoryDeductedAt: sharedDeductedLog.inventoryDeductedAt,
+      inventoryDeductionKey: deductionKey,
+      inventoryDeductionInfo: "Składniki zostały już rozliczone przy wcześniejszym wspólnym przygotowaniu.",
+      inventoryOperationIds: sharedDeductedLog.inventoryOperationIds ?? [],
+      updatedAt: new Date().toISOString()
+    });
+    return {
+      status: "zapisano",
+      ostrzezenia: [],
+      inventoryDeducted: false,
+      inventoryDeductionInfo: "Składniki zostały już rozliczone przy wcześniejszym wspólnym przygotowaniu."
+    };
+  }
+
+  const ingredients = resolveIngredientsForDeduction(meal);
+  const inventoryRows = await getInventoryItems();
+  const inventoryMap = new Map<string, InventoryItemRecord>();
+  inventoryRows.forEach((row) => inventoryMap.set(buildItemKey(row.productKey, row.jednostka), row));
+
+  const warnings: OstrzezenieMagazynu[] = [];
+  const deductions: Array<{ ingredient: Skladnik; productKey: string; unit: string; deductedAmount: number }> = [];
+
+  ingredients.forEach((ingredient) => {
+    const unit = normalizeUnit(ingredient.jednostka);
+    if (!isSupportedInventoryUnit(unit)) {
+      warnings.push({
+        typ: "nieobslugiwana_jednostka",
+        skladnikNazwa: ingredient.nazwa,
+        jednostka: ingredient.jednostka,
+        wymaganaIlosc: ingredient.ilosc,
+        dostepnaIlosc: 0
+      });
+      return;
+    }
+
+    const product = normalizeProductName(ingredient.nazwa);
+    const itemKey = buildItemKey(product.productKey, unit);
+    const currentItem = inventoryMap.get(itemKey);
+    const available = currentItem?.ilosc ?? 0;
+    const deductedAmount = Math.max(0, Math.min(ingredient.ilosc, available));
+
+    if (!currentItem) {
+      warnings.push({
+        typ: "brak_produktu",
+        skladnikNazwa: ingredient.nazwa,
+        jednostka: unit,
+        wymaganaIlosc: ingredient.ilosc,
+        dostepnaIlosc: 0
+      });
+    } else if (available < ingredient.ilosc) {
+      warnings.push({
+        typ: "brak_ilosci",
+        skladnikNazwa: ingredient.nazwa,
+        jednostka: unit,
+        wymaganaIlosc: ingredient.ilosc,
+        dostepnaIlosc: available
+      });
+    }
+
+    deductions.push({
+      ingredient,
+      productKey: product.productKey,
+      unit,
+      deductedAmount
+    });
+  });
+
+  if (warnings.length > 0 && !options?.forceOnWarnings) {
+    return {
+      status: "wymaga_potwierdzenia",
+      ostrzezenia: warnings,
+      inventoryDeducted: false
+    };
+  }
+
+  const operationIds: string[] = [];
+  for (const deduction of deductions) {
+    if (deduction.deductedAmount <= 0) continue;
+    await addInventoryAmount(deduction.productKey, deduction.unit, -deduction.deductedAmount, deduction.ingredient.nazwa);
+    const operationId = crypto.randomUUID();
+    operationIds.push(operationId);
+    await dbPut<OperacjaMagazynuRecord>(STORE.INVENTORY_OPERATIONS, {
+      id: operationId,
+      data,
+      dzienDietyId: day.id,
+      posilekId: meal.id,
+      inventoryDeductionKey: deductionKey,
+      skladnikNazwa: deduction.ingredient.nazwa,
+      productKey: deduction.productKey,
+      wymaganaIlosc: deduction.ingredient.ilosc,
+      odjetaIlosc: deduction.deductedAmount,
+      jednostka: deduction.unit,
+      createdAt: new Date().toISOString(),
+      notatka: deduction.deductedAmount < deduction.ingredient.ilosc ? "Odjęto częściowo z powodu braków." : ""
+    });
+  }
+
+  await dbPut<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS, {
+    id,
+    data,
+    dzienDietyId: day.id,
+    posilekId: meal.id,
+    przygotowany: true,
+    zjedzony: current?.zjedzony ?? false,
+    notatka: current?.notatka ?? "",
+    inventoryDeducted: true,
+    inventoryDeductedAt: new Date().toISOString(),
+    inventoryDeductionKey: deductionKey,
+    inventoryDeductionInfo:
+      warnings.length > 0
+        ? "Składniki odjęto częściowo. Część pozycji była niedostępna lub w zbyt małej ilości."
+        : "Składniki odjęto z magazynu.",
+    inventoryOperationIds: operationIds,
+    updatedAt: new Date().toISOString()
+  });
+
+  return {
+    status: "zapisano",
+    ostrzezenia: warnings,
+    inventoryDeducted: true,
+    inventoryDeductionInfo:
+      warnings.length > 0
+        ? "Składniki odjęto częściowo. Część pozycji była niedostępna lub w zbyt małej ilości."
+        : "Składniki odjęto z magazynu."
+  };
 }
 
 export async function getShoppingStates(listKey: string): Promise<StanZakupuRecord[]> {
@@ -324,6 +789,156 @@ export async function setPantryItem(productKey: string, label: string, aktywny: 
 
 export async function removePantryItem(productKey: string): Promise<void> {
   await dbDelete(STORE.PANTRY_ITEMS, productKey);
+}
+
+export async function getInventoryCatalog(): Promise<InventoryCatalogItemRecord[]> {
+  try {
+    const rows = await dbGetAll<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG);
+    return rows.map(normalizeInventoryCatalogItem).filter((it) => it.aktywny).sort((a, b) => a.nazwa.localeCompare(b.nazwa, "pl"));
+  } catch (error) {
+    if (!isMissingStoreError(error)) throw error;
+    return BASE_INVENTORY_CATALOG.map((it) => normalizeInventoryCatalogItem(it));
+  }
+}
+
+export async function getInventoryItems(): Promise<InventoryItemRecord[]> {
+  const rows = await dbGetAll<InventoryItemRecord>(STORE.INVENTORY_ITEMS);
+  return rows
+    .map((row) => normalizeInventoryItem(row))
+    .sort((a, b) => a.nazwa.localeCompare(b.nazwa, "pl"));
+}
+
+export async function upsertInventoryItem(input: {
+  nazwa: string;
+  ilosc: number;
+  jednostka: string;
+  grupa?: ShoppingGroup;
+  lokalizacja?: LokalizacjaMagazynu;
+  notatka?: string;
+  dataWaznosci?: string;
+}): Promise<void> {
+  const next = normalizeInventoryItem(input);
+  const catalogRow: InventoryCatalogItemRecord = normalizeInventoryCatalogItem({
+    id: next.id,
+    productKey: next.productKey,
+    nazwa: next.nazwa,
+    jednostka: next.jednostka,
+    grupa: next.grupa,
+    bazowyZPlanu: false,
+    source: "manual",
+    aktywny: true,
+    updatedAt: new Date().toISOString()
+  });
+  const current = await dbGet<InventoryItemRecord>(STORE.INVENTORY_ITEMS, next.id);
+  try {
+    const currentCatalog = await dbGet<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG, next.id);
+    if (!currentCatalog) {
+      await dbPut<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG, catalogRow);
+    }
+  } catch (error) {
+    if (!isMissingStoreError(error)) throw error;
+  }
+  await dbPut<InventoryItemRecord>(STORE.INVENTORY_ITEMS, {
+    ...next,
+    ilosc: Number.isFinite(next.ilosc) ? next.ilosc : current?.ilosc ?? 0,
+    bazowyZPlanu: current?.bazowyZPlanu ?? false,
+    source: current?.source ?? "manual",
+    updatedAt: new Date().toISOString()
+  });
+}
+
+export async function setInventoryAmount(productKey: string, jednostka: string, ilosc: number, nazwaHint?: string): Promise<void> {
+  const unit = normalizeUnit(jednostka);
+  const id = inventoryId(productKey, unit);
+  const current = await dbGet<InventoryItemRecord>(STORE.INVENTORY_ITEMS, id);
+  const next = normalizeInventoryItem({
+    ...(current ?? {}),
+    id,
+    productKey,
+    nazwa: current?.nazwa ?? nazwaHint ?? productKey,
+    ilosc,
+    jednostka: unit,
+    grupa: current?.grupa
+  });
+  try {
+    const currentCatalog = await dbGet<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG, id);
+    if (!currentCatalog) {
+      await dbPut<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG, normalizeInventoryCatalogItem({
+        id,
+        productKey,
+        nazwa: next.nazwa,
+        jednostka: unit,
+        grupa: next.grupa,
+        bazowyZPlanu: false,
+        source: "manual",
+        aktywny: true,
+        updatedAt: new Date().toISOString()
+      }));
+    }
+  } catch (error) {
+    if (!isMissingStoreError(error)) throw error;
+  }
+  await dbPut<InventoryItemRecord>(STORE.INVENTORY_ITEMS, { ...next, updatedAt: new Date().toISOString() });
+}
+
+export async function addInventoryAmount(productKey: string, jednostka: string, delta: number, nazwaHint?: string): Promise<void> {
+  const unit = normalizeUnit(jednostka);
+  const id = inventoryId(productKey, unit);
+  const current = await dbGet<InventoryItemRecord>(STORE.INVENTORY_ITEMS, id);
+  const currentAmount = current?.ilosc ?? 0;
+  const nextAmount = Math.max(0, currentAmount + delta);
+  const next = normalizeInventoryItem({
+    ...(current ?? {}),
+    id,
+    productKey,
+    nazwa: current?.nazwa ?? nazwaHint ?? productKey,
+    ilosc: nextAmount,
+    jednostka: unit,
+    grupa: current?.grupa
+  });
+  try {
+    const currentCatalog = await dbGet<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG, id);
+    if (!currentCatalog) {
+      await dbPut<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG, normalizeInventoryCatalogItem({
+        id,
+        productKey,
+        nazwa: next.nazwa,
+        jednostka: unit,
+        grupa: next.grupa,
+        bazowyZPlanu: false,
+        source: "manual",
+        aktywny: true,
+        updatedAt: new Date().toISOString()
+      }));
+    }
+  } catch (error) {
+    if (!isMissingStoreError(error)) throw error;
+  }
+  await dbPut<InventoryItemRecord>(STORE.INVENTORY_ITEMS, { ...next, updatedAt: new Date().toISOString() });
+}
+
+export async function removeInventoryItem(id: string): Promise<void> {
+  const current = await dbGet<InventoryItemRecord>(STORE.INVENTORY_ITEMS, id);
+  if (!current) return;
+  if (current.bazowyZPlanu) {
+    await dbPut<InventoryItemRecord>(STORE.INVENTORY_ITEMS, {
+      ...current,
+      ilosc: 0,
+      updatedAt: new Date().toISOString()
+    });
+    return;
+  }
+  await dbDelete(STORE.INVENTORY_ITEMS, id);
+  try {
+    await dbDelete(STORE.INVENTORY_CATALOG, id);
+  } catch (error) {
+    if (!isMissingStoreError(error)) throw error;
+  }
+}
+
+export async function getInventoryOperations(): Promise<OperacjaMagazynuRecord[]> {
+  const rows = await dbGetAll<OperacjaMagazynuRecord>(STORE.INVENTORY_OPERATIONS);
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 export async function getShoppingManualItems(listKey: string): Promise<ShoppingManualItemRecord[]> {
@@ -404,12 +1019,18 @@ export async function removeNote(id: string): Promise<void> {
 }
 
 export async function exportAllData(): Promise<ExportAplikacji> {
-  const [dietDays, dayLogs, mealLogs, shoppingStatesRaw, pantryItems, shoppingManualItems, settings, notes, meta] = await Promise.all([
+  const [dietDays, dayLogs, mealLogs, shoppingStatesRaw, pantryItems, inventoryCatalog, inventoryItems, inventoryOperations, shoppingManualItems, settings, notes, meta] = await Promise.all([
     dbGetAll<DzienDiety>(STORE.DIET_DAYS),
     dbGetAll<DzienRealizacjiRecord>(STORE.DAY_LOGS),
     dbGetAll<RealizacjaPosilkuRecord>(STORE.MEAL_LOGS),
     dbGetAll<LegacyShoppingState>(STORE.SHOPPING_STATES),
     dbGetAll<SpizarniaItemRecord>(STORE.PANTRY_ITEMS),
+    dbGetAll<InventoryCatalogItemRecord>(STORE.INVENTORY_CATALOG).catch((error) => {
+      if (isMissingStoreError(error)) return [];
+      throw error;
+    }),
+    dbGetAll<InventoryItemRecord>(STORE.INVENTORY_ITEMS),
+    dbGetAll<OperacjaMagazynuRecord>(STORE.INVENTORY_OPERATIONS),
     dbGetAll<ShoppingManualItemRecord>(STORE.SHOPPING_MANUAL_ITEMS),
     dbGetAll<UstawieniaAplikacji>(STORE.SETTINGS),
     dbGetAll<NotatkaRecord>(STORE.NOTES),
@@ -419,9 +1040,9 @@ export async function exportAllData(): Promise<ExportAplikacji> {
   const shoppingStates = shoppingStatesRaw.map(normalizeShoppingState);
 
   return {
-    version: 3,
+    version: 6,
     exportedAt: new Date().toISOString(),
-    data: { dietDays, dayLogs, mealLogs, shoppingStates, pantryItems, shoppingManualItems, settings, notes, meta }
+    data: { dietDays, dayLogs, mealLogs, shoppingStates, pantryItems, inventoryCatalog, inventoryItems, inventoryOperations, shoppingManualItems, settings, notes, meta }
   };
 }
 
@@ -473,6 +1094,11 @@ export async function importAllData(payload: ExportAplikacji): Promise<void> {
     dbClear(STORE.SHOPPING_STATES),
     dbClear(STORE.SHOPPING_MANUAL_ITEMS),
     dbClear(STORE.PANTRY_ITEMS),
+    dbClear(STORE.INVENTORY_CATALOG).catch((error) => {
+      if (!isMissingStoreError(error)) throw error;
+    }),
+    dbClear(STORE.INVENTORY_ITEMS),
+    dbClear(STORE.INVENTORY_OPERATIONS),
     dbClear(STORE.SETTINGS),
     dbClear(STORE.NOTES),
     dbClear(STORE.META)
@@ -491,8 +1117,16 @@ export async function importAllData(payload: ExportAplikacji): Promise<void> {
       aktywny: true,
       updatedAt: new Date().toISOString()
     }))),
+    dbBulkPut(
+      STORE.INVENTORY_CATALOG,
+      (payload.data.inventoryCatalog ?? BASE_INVENTORY_CATALOG).map((item) => normalizeInventoryCatalogItem(item))
+    ),
+    dbBulkPut(STORE.INVENTORY_ITEMS, (payload.data.inventoryItems ?? []).map((item) => normalizeInventoryItem(item))),
+    dbBulkPut(STORE.INVENTORY_OPERATIONS, payload.data.inventoryOperations ?? []),
     dbBulkPut(STORE.SETTINGS, payload.data.settings?.length ? payload.data.settings.map(normalizeSettings) : [DEFAULT_SETTINGS]),
     dbBulkPut(STORE.NOTES, payload.data.notes ?? []),
-    dbBulkPut(STORE.META, [{ key: "seeded", value: "1" }, { key: "pantrySeeded", value: "1" }])
+    dbBulkPut(STORE.META, [{ key: "seeded", value: "1" }, { key: "pantrySeeded", value: "1" }, { key: "inventoryCatalogSeeded", value: "1" }])
   ]);
+
+  await seedBaseInventoryCatalog();
 }

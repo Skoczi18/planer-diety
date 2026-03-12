@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   getDayLog,
+  getInventoryItems,
   getMealLogsByDate,
-  getPantryItems,
   getShoppingManualItems,
   getShoppingStates,
   saveDayNote,
@@ -15,6 +15,7 @@ import { useApp } from "../context/AppContext";
 import { toISODate } from "../lib/date";
 import { aggregateShoppingItems, buildShoppingListKey, ShoppingSelection } from "../lib/shoppingAggregator";
 import { calculatePostepDnia, getAutoStatusDnia, getDayForDate, getKomentarzPostepu, statusDniaLabel } from "../lib/execution";
+import { runPrepareMealFlow } from "../lib/mealPreparationFlow";
 import { DzienRealizacjiRecord, RealizacjaPosilkuRecord } from "../types";
 
 export function TodayPage() {
@@ -29,6 +30,7 @@ export function TodayPage() {
   const [missingCount, setMissingCount] = useState(0);
   const [noteDraft, setNoteDraft] = useState("");
   const [weightDraft, setWeightDraft] = useState("");
+  const [actionInfo, setActionInfo] = useState("");
 
   const day = useMemo(() => {
     if (!settings) return undefined;
@@ -47,36 +49,52 @@ export function TodayPage() {
 
   const load = async () => {
     if (!day || !shoppingSelection) {
+      console.info("[Today] skip load - brak day/selection");
       setLoading(false);
       return;
     }
 
     setLoading(true);
     setError("");
+    console.info("[Today] load start", { date: today, dayId: day.id, listKey });
     try {
-      const [logs, currentDayLog, shoppingStates, pantryItems, manualRows] = await Promise.all([
+      const [logs, currentDayLog, shoppingStates, inventoryResult, manualRows] = await Promise.all([
         getMealLogsByDate(today),
         getDayLog(today),
         getShoppingStates(listKey),
-        getPantryItems(),
+        getInventoryItems()
+          .then((rows) => ({ ok: true as const, rows }))
+          .catch((err) => {
+            console.error("[Today] inventory load failed, fallback []", err);
+            return { ok: false as const, rows: [] };
+          }),
         getShoppingManualItems(listKey)
       ]);
+      console.info("[Today] load core success", {
+        mealLogs: logs.length,
+        hasDayLog: !!currentDayLog,
+        shoppingStates: shoppingStates.length,
+        inventory: inventoryResult.rows.length,
+        inventoryOk: inventoryResult.ok
+      });
 
       setMealLogs(logs.filter((it) => it.dzienDietyId === day.id || !it.dzienDietyId));
       setDayLog(currentDayLog);
       setNoteDraft(currentDayLog?.notatka ?? "");
       setWeightDraft(typeof currentDayLog?.wagaKg === "number" ? String(currentDayLog.wagaKg) : "");
 
-      const aggregated = aggregateShoppingItems([day], listKey, shoppingStates, pantryItems, manualRows);
+      const aggregated = aggregateShoppingItems([day], listKey, shoppingStates, manualRows, inventoryResult.rows);
       const missing = aggregated.filter((item) => item.brakuje);
 
       setMissingCount(missing.length);
-      setMissingItems(missing.slice(0, 5).map((item) => `${item.nazwa} (${item.ilosc} ${item.jednostka})`));
+      setMissingItems(missing.slice(0, 5).map((item) => `${item.nazwa} (brakuje ${item.brakujacaIlosc} ${item.jednostka})`));
+      console.info("[Today] load done", { missing: missing.length });
     } catch (err) {
       console.error(err);
       setError("Nie udało się wczytać danych dnia. Odśwież aplikację.");
     } finally {
       setLoading(false);
+      console.info("[Today] loading=false");
     }
   };
 
@@ -95,13 +113,35 @@ export function TodayPage() {
   const completedDay = postep.procent >= 100;
 
   const togglePrepared = async (mealId: string, current: boolean) => {
-    await setMealStatus(today, day.id, day.numerDnia, mealId, { przygotowany: !current });
+    const meal = day.posilki.find((it) => it.id === mealId);
+    if (!meal) return;
+
+    if (!current) {
+      const result = await runPrepareMealFlow(today, day, meal);
+      if (result.inventoryDeductionInfo) setActionInfo(result.inventoryDeductionInfo);
+    } else {
+      const log = mealLogs.find((entry) => entry.posilekId === mealId);
+      await setMealStatus(today, day.id, day.numerDnia, mealId, { przygotowany: false });
+      if (log?.inventoryDeducted) {
+        setActionInfo("Składniki zostały już odjęte wcześniej i nie są automatycznie przywracane.");
+      }
+    }
     await load();
   };
 
   const toggleEaten = async (mealId: string, current: boolean) => {
-    await setMealStatus(today, day.id, day.numerDnia, mealId, { zjedzony: !current, przygotowany: !current ? true : undefined });
-    await load();
+    const log = mealLogs.find((entry) => entry.posilekId === mealId);
+    if (!current && !log?.przygotowany) {
+      setActionInfo("Najpierw oznacz posiłek jako przygotowany. Bez przygotowania nie można oznaczyć go jako zjedzony.");
+      return;
+    }
+    try {
+      await setMealStatus(today, day.id, day.numerDnia, mealId, { zjedzony: !current });
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Nie udało się zaktualizować statusu posiłku.";
+      setActionInfo(message);
+    }
   };
 
   const saveNote = async () => {
@@ -158,26 +198,9 @@ export function TodayPage() {
         </div>
       </section>
 
-      {completedDay && <section className="success-state">Plan dnia zrealizowany. Świetna robota.</section>}
+      {actionInfo ? <section className="card"><p>{actionInfo}</p></section> : null}
 
-      <section className="card">
-        <h3>Szybkie akcje</h3>
-        <div className="grid grid-2">
-          <label className="field">
-            Waga (kg)
-            <input type="number" step="0.1" value={weightDraft} onChange={(e) => setWeightDraft(e.target.value)} placeholder="np. 80.9" />
-          </label>
-          <button className="btn btn-primary" onClick={saveWeight}>
-            {typeof dayLog?.wagaKg === "number" ? "Zaktualizuj wagę" : "Dodaj wagę"}
-          </button>
-        </div>
-        <div className="grid grid-2">
-          <button className="btn" onClick={saveNote}>{dayLog?.notatka ? "Zapisz notatkę" : "Dodaj notatkę"}</button>
-          <button className={status === "odstepstwo" ? "btn btn-success" : "btn"} onClick={toggleDeviation}>
-            {status === "odstepstwo" ? "Cofnij odstępstwo" : "Oznacz odstępstwo"}
-          </button>
-        </div>
-      </section>
+      {completedDay && <section className="success-state">Plan dnia zrealizowany. Świetna robota.</section>}
 
       <section className="card">
         <h3>Posiłki na dziś</h3>
@@ -197,10 +220,17 @@ export function TodayPage() {
                   <button className={prepared ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => togglePrepared(meal.id, prepared)}>
                     {prepared ? "Przygotowany" : "Przygotuj"}
                   </button>
-                  <button className={eaten ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleEaten(meal.id, eaten)}>
+                  <button
+                    className={eaten ? "btn btn-small btn-success" : "btn btn-small"}
+                    onClick={() => toggleEaten(meal.id, eaten)}
+                    disabled={!prepared && !eaten}
+                    title={!prepared && !eaten ? "Najpierw oznacz posiłek jako przygotowany." : undefined}
+                  >
                     {eaten ? "Zjedzony" : "Oznacz zjedzony"}
                   </button>
                 </div>
+                {log?.inventoryDeducted ? <p className="muted-line">Składniki odjęte z magazynu.</p> : null}
+                {log?.inventoryDeductionInfo ? <p className="muted-line">{log.inventoryDeductionInfo}</p> : null}
               </li>
             );
           })}

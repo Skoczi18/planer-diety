@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { getMealLogsByDate, setMealStatus } from "../db/repository";
+import { getMealLogsByDate, setMealPreparedWithInventory, setMealStatus } from "../db/repository";
 import { useApp } from "../context/AppContext";
 import { toISODate } from "../lib/date";
 import { useSelectedDate } from "../lib/dateRoute";
+import { runPrepareMealFlow } from "../lib/mealPreparationFlow";
 import { RealizacjaPosilkuRecord } from "../types";
 
 export function MealDetailsPage() {
@@ -12,6 +13,7 @@ export function MealDetailsPage() {
   const selectedDate = useSelectedDate(toISODate());
   const [log, setLog] = useState<RealizacjaPosilkuRecord | undefined>();
   const [noteDraft, setNoteDraft] = useState("");
+  const [actionInfo, setActionInfo] = useState("");
 
   const day = useMemo(() => dieta.find((d) => d.id === dayId), [dieta, dayId]);
   const meal = useMemo(() => day?.posilki.find((m) => m.id === mealId), [day, mealId]);
@@ -35,13 +37,30 @@ export function MealDetailsPage() {
   const eaten = !!log?.zjedzony;
 
   const togglePrepared = async () => {
-    await setMealStatus(selectedDate, day.id, day.numerDnia, meal.id, { przygotowany: !prepared });
+    if (!prepared) {
+      const result = await runPrepareMealFlow(selectedDate, day, meal);
+      if (result.inventoryDeductionInfo) setActionInfo(result.inventoryDeductionInfo);
+    } else {
+      await setMealPreparedWithInventory(selectedDate, day, meal, false);
+      if (log?.inventoryDeducted) {
+        setActionInfo("Składniki zostały już odjęte wcześniej i nie są automatycznie przywracane.");
+      }
+    }
     await load();
   };
 
   const toggleEaten = async () => {
-    await setMealStatus(selectedDate, day.id, day.numerDnia, meal.id, { zjedzony: !eaten, przygotowany: !eaten ? true : undefined });
-    await load();
+    if (!eaten && !prepared) {
+      setActionInfo("Najpierw oznacz posiłek jako przygotowany. Bez przygotowania nie można oznaczyć go jako zjedzony.");
+      return;
+    }
+    try {
+      await setMealStatus(selectedDate, day.id, day.numerDnia, meal.id, { zjedzony: !eaten });
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Nie udało się zaktualizować statusu posiłku.";
+      setActionInfo(message);
+    }
   };
 
   const saveNote = async () => {
@@ -64,10 +83,18 @@ export function MealDetailsPage() {
           <button className={prepared ? "btn btn-success" : "btn"} onClick={togglePrepared}>
             {prepared ? "Przygotowany" : "Oznacz przygotowany"}
           </button>
-          <button className={eaten ? "btn btn-success" : "btn"} onClick={toggleEaten}>
+          <button
+            className={eaten ? "btn btn-success" : "btn"}
+            onClick={toggleEaten}
+            disabled={!prepared && !eaten}
+            title={!prepared && !eaten ? "Najpierw oznacz posiłek jako przygotowany." : undefined}
+          >
             {eaten ? "Zjedzony" : "Oznacz zjedzony"}
           </button>
         </div>
+        {log?.inventoryDeducted ? <p className="muted-line">Składniki odjęte z magazynu.</p> : null}
+        {log?.inventoryDeductionInfo ? <p className="muted-line">{log.inventoryDeductionInfo}</p> : null}
+        {actionInfo ? <p className="muted-line">{actionInfo}</p> : null}
       </section>
 
       <section className="card">

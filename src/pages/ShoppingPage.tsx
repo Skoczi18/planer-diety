@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useApp } from "../context/AppContext";
 import {
-  getPantryItems,
+  addInventoryAmount,
+  getInventoryItems,
   getShoppingManualItems,
   getShoppingStates,
   markShoppingItemRemoved,
-  setPantryItem,
+  setInventoryAmount,
   setShoppingState,
   upsertShoppingManualItem
 } from "../db/repository";
@@ -23,8 +24,7 @@ import {
 } from "../lib/shoppingAggregator";
 import { toISODate } from "../lib/date";
 import { getDayForDate } from "../lib/execution";
-import { normalizeProductName } from "../lib/shoppingNormalize";
-import { ShoppingFilter, ShoppingManualItemRecord, ShoppingMode, SpizarniaItemRecord, StanZakupuRecord } from "../types";
+import { InventoryItemRecord, ShoppingFilter, ShoppingManualItemRecord, StanZakupuRecord } from "../types";
 
 const FILTERS: Array<{ value: ShoppingFilter; label: string }> = [
   { value: "wszystko", label: "Wszystko" },
@@ -38,15 +38,19 @@ export function ShoppingPage() {
   const { dieta, settings } = useApp();
   const [searchParams] = useSearchParams();
 
-  const [mode, setMode] = useState<ShoppingMode>((searchParams.get("scope") as ShoppingMode) || "dzien");
-  const [selectedDay, setSelectedDay] = useState<string>(searchParams.get("dayId") || "d1");
-  const [multiDays, setMultiDays] = useState<string[]>(normalizeSelectionDayIds(searchParams.get("days")?.split(",").filter(Boolean) || []));
+  const initialDays = useMemo(() => {
+    const fromDaysParam = searchParams.get("days")?.split(",").filter(Boolean) || [];
+    const fromDayParam = searchParams.get("dayId");
+    const resolved = fromDaysParam.length ? fromDaysParam : fromDayParam ? [fromDayParam] : [];
+    return normalizeSelectionDayIds(resolved);
+  }, [searchParams]);
+  const [multiDays, setMultiDays] = useState<string[]>(initialDays);
   const [filter, setFilter] = useState<ShoppingFilter>((searchParams.get("filter") as ShoppingFilter) || "wszystko");
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [states, setStates] = useState<StanZakupuRecord[]>([]);
-  const [pantry, setPantry] = useState<SpizarniaItemRecord[]>([]);
+  const [inventory, setInventory] = useState<InventoryItemRecord[]>([]);
   const [manualItems, setManualItems] = useState<ShoppingManualItemRecord[]>([]);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
@@ -54,24 +58,13 @@ export function ShoppingPage() {
   const [customQty, setCustomQty] = useState<number>(1);
   const [customUnit, setCustomUnit] = useState("szt.");
   const [customNote, setCustomNote] = useState("");
-
-  const [editKey, setEditKey] = useState<string>("");
-  const [editName, setEditName] = useState("");
-  const [editQty, setEditQty] = useState<number>(0);
-  const [editUnit, setEditUnit] = useState("g");
-  const [editNote, setEditNote] = useState("");
-
-  useEffect(() => {
-    if (!dieta.length) return;
-    if (dieta.find((d) => d.id === selectedDay)) return;
-    setSelectedDay(dieta[0].id);
-  }, [dieta, selectedDay]);
+  const [buyingItem, setBuyingItem] = useState<(ReturnType<typeof aggregateShoppingItems>[number]) | null>(null);
+  const [buyQty, setBuyQty] = useState<number>(0);
+  const [buyError, setBuyError] = useState("");
 
   const selection: ShoppingSelection = useMemo(() => {
-    if (mode === "tydzien") return { mode, dayIds: dieta.map((d) => d.id) };
-    if (mode === "dzien") return { mode, dayIds: [selectedDay] };
-    return { mode, dayIds: normalizeSelectionDayIds(multiDays) };
-  }, [mode, dieta, selectedDay, multiDays]);
+    return { mode: "wiele", dayIds: normalizeSelectionDayIds(multiDays) };
+  }, [multiDays]);
 
   const selectedDays = useMemo(() => resolveSelectedDays(dieta, selection), [dieta, selection]);
   const listKey = useMemo(() => buildShoppingListKey(selection), [selection]);
@@ -85,23 +78,31 @@ export function ShoppingPage() {
   }, [selectedDayNumbers]);
   const multiSelectionKey = useMemo(() => buildSelectedDaysKey(multiDays), [multiDays]);
 
-  const load = async () => {
-    setLoading(true);
-    setError("");
+  const load = async (options?: { silent?: boolean }) => {
+    const silent = !!options?.silent;
+    if (!silent) {
+      setLoading(true);
+      setError("");
+    }
     try {
-      const [shoppingStates, pantryItems, customRows] = await Promise.all([
+      const [shoppingStates, inventoryResult, customRows] = await Promise.all([
         getShoppingStates(listKey),
-        getPantryItems(),
+        getInventoryItems()
+          .then((rows) => ({ ok: true as const, rows }))
+          .catch((err) => {
+            console.error("[Shopping] inventory load failed, fallback []", err);
+            return { ok: false as const, rows: [] };
+          }),
         getShoppingManualItems(listKey)
       ]);
       setStates(shoppingStates);
-      setPantry(pantryItems);
+      setInventory(inventoryResult.rows);
       setManualItems(customRows);
     } catch (err) {
       console.error(err);
       setError("Nie udało się wczytać listy zakupów.");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -111,14 +112,14 @@ export function ShoppingPage() {
   }, [listKey]);
 
   const aggregated = useMemo(
-    () => aggregateShoppingItems(selectedDays, listKey, states, pantry, manualItems),
-    [selectedDays, listKey, states, pantry, manualItems]
+    () => aggregateShoppingItems(selectedDays, listKey, states, manualItems, inventory),
+    [selectedDays, listKey, states, manualItems, inventory]
   );
 
   const filtered = useMemo(() => filterShoppingItems(aggregated, filter), [aggregated, filter]);
   const grouped = useMemo(() => groupShoppingItems(filtered), [filtered]);
   const missingCount = useMemo(() => countMissing(aggregated), [aggregated]);
-  const boughtCount = useMemo(() => aggregated.filter((item) => item.kupione || item.mamWDomu || item.wSpizarni).length, [aggregated]);
+  const boughtCount = useMemo(() => aggregated.filter((item) => !item.brakuje).length, [aggregated]);
   const totalCount = aggregated.length;
   const progress = totalCount ? Math.round((boughtCount / totalCount) * 100) : 0;
 
@@ -133,22 +134,57 @@ export function ShoppingPage() {
     const today = toISODate();
     const mapped = settings ? getDayForDate(dieta, settings, today) : undefined;
     if (!mapped) return;
-    if (mode === "dzien") {
-      setSelectedDay(mapped.id);
-      return;
-    }
-    if (mode !== "wiele") setMode("wiele");
     setMultiDays([mapped.id]);
   };
 
-  const toggleState = async (productKey: string, field: "kupione" | "mamWDomu", current: boolean) => {
-    await setShoppingState(listKey, productKey, { [field]: !current });
-    await load();
+  const toggleBought = async (item: (typeof aggregated)[number]) => {
+    if (item.kupione) {
+      await setShoppingState(listKey, item.itemKey, { kupione: false });
+      await load({ silent: true });
+      return;
+    }
+
+    setBuyingItem(item);
+    setBuyQty(item.ilosc);
+    setBuyError("");
   };
 
-  const togglePantryForItem = async (productKey: string, label: string, current: boolean) => {
-    await setPantryItem(productKey, label, !current);
-    await load();
+  const closeBuyDialog = () => {
+    setBuyingItem(null);
+    setBuyQty(0);
+    setBuyError("");
+  };
+
+  const submitBoughtAmount = async () => {
+    if (!buyingItem) return;
+    const isPieceUnit = buyingItem.jednostka === "szt.";
+    const normalizedQty = isPieceUnit ? Math.trunc(buyQty) : buyQty;
+    if (!Number.isFinite(normalizedQty) || normalizedQty <= 0) {
+      setBuyError("Wpisz poprawną ilość większą od 0.");
+      return;
+    }
+    if (isPieceUnit && !Number.isInteger(buyQty)) {
+      setBuyError("Dla sztuk podaj liczbę całkowitą.");
+      return;
+    }
+
+    await addInventoryAmount(buyingItem.productKey, buyingItem.jednostka, normalizedQty, buyingItem.nazwa);
+    await setShoppingState(listKey, buyingItem.itemKey, { kupione: true });
+    closeBuyDialog();
+    await load({ silent: true });
+  };
+
+  const markAsHave = async (item: (typeof aggregated)[number]) => {
+    if (item.mamWDomu) {
+      await setShoppingState(listKey, item.itemKey, { mamWDomu: false });
+      await load({ silent: true });
+      return;
+    }
+
+    const targetAmount = Math.max(item.ilosc, item.iloscWMagazynie);
+    await setInventoryAmount(item.productKey, item.jednostka, targetAmount, item.nazwa);
+    await setShoppingState(listKey, item.itemKey, { mamWDomu: true });
+    await load({ silent: true });
   };
 
   const addCustomItem = async () => {
@@ -164,39 +200,16 @@ export function ShoppingPage() {
     setCustomQty(1);
     setCustomUnit("szt.");
     setCustomNote("");
-    await load();
-  };
-
-  const startEdit = (item: (typeof aggregated)[number]) => {
-    setEditKey(item.itemKey);
-    setEditName(item.nazwa);
-    setEditQty(item.ilosc);
-    setEditUnit(item.jednostka);
-    setEditNote(item.notatka ?? "");
-  };
-
-  const saveEdit = async () => {
-    if (!editKey || !editName.trim()) return;
-    await upsertShoppingManualItem(listKey, {
-      itemKey: editKey,
-      nazwa: editName,
-      ilosc: editQty,
-      jednostka: editUnit,
-      notatka: editNote,
-      typ: "override"
-    });
-    setEditKey("");
-    await load();
+    await load({ silent: true });
   };
 
   const removeFromList = async (itemKey: string, name: string) => {
     await markShoppingItemRemoved(listKey, itemKey, name);
-    await load();
+    await load({ silent: true });
   };
 
-  const pantryActive = pantry.filter((it) => it.aktywny);
-  const noSelectedDaysInMultiMode = mode === "wiele" && selection.dayIds.length === 0;
-  const showList = !noSelectedDaysInMultiMode;
+  const noSelectedDays = selection.dayIds.length === 0;
+  const showList = !noSelectedDays;
 
   if (loading) return <p className="empty">Ładowanie zakupów...</p>;
   if (error) return <p className="empty">{error}</p>;
@@ -205,51 +218,23 @@ export function ShoppingPage() {
     <div className="stack shopping-page-flow">
       <section className="card shopping-header-card shopping-controls-card">
         <h3>Zakupy</h3>
-        <div className="grid grid-3">
-          <button className={mode === "dzien" ? "btn btn-primary" : "btn"} onClick={() => setMode("dzien")}>1 dzień</button>
-          <button className={mode === "wiele" ? "btn btn-primary" : "btn"} onClick={() => setMode("wiele")}>Wiele dni</button>
-          <button className={mode === "tydzien" ? "btn btn-primary" : "btn"} onClick={() => setMode("tydzien")}>Tydzień</button>
+        <div className="day-chip-list">
+          {dieta.map((day) => {
+            const active = multiDays.includes(day.id);
+            return (
+              <button type="button" key={day.id} className={active ? "chip active" : "chip"} onClick={() => toggleMultiDay(day.id)}>
+                Dzień {day.numerDnia}
+              </button>
+            );
+          })}
         </div>
-
-        {mode === "dzien" && (
-          <label className="field">
-            Wybierz dzień
-            <select value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)}>
-              {dieta.map((day) => (
-                <option key={day.id} value={day.id}>{day.nazwa}</option>
-              ))}
-            </select>
-          </label>
-        )}
-
-        {mode === "wiele" && (
-          <>
-            <div className="day-chip-list">
-              {dieta.map((day) => {
-                const active = multiDays.includes(day.id);
-                return (
-                  <button key={day.id} className={active ? "chip active" : "chip"} onClick={() => toggleMultiDay(day.id)}>
-                    Dzień {day.numerDnia}
-                  </button>
-                );
-              })}
-            </div>
-            <div className="quick-day-actions">
-              <button className="btn btn-small" onClick={selectAllDays}>Zaznacz wszystko</button>
-              <button className="btn btn-small" onClick={clearMultiDays}>Wyczyść wybór</button>
-              <button className="btn btn-small" onClick={selectOnlyToday}>Wybierz tylko dzisiaj</button>
-              <button className="btn btn-small" onClick={selectWeek}>Wybierz cały tydzień</button>
-            </div>
-            <p className="muted-line">Klucz listy: <strong>multi:{multiSelectionKey}</strong></p>
-          </>
-        )}
-
-        {mode !== "wiele" && (
-          <div className="quick-day-actions">
-            <button className="btn btn-small" onClick={() => setMode("wiele")}>Przełącz na wiele dni</button>
-            <button className="btn btn-small" onClick={selectOnlyToday}>Wybierz tylko dzisiaj</button>
-          </div>
-        )}
+        <div className="quick-day-actions">
+          <button type="button" className="btn btn-small" onClick={selectAllDays}>Zaznacz wszystko</button>
+          <button type="button" className="btn btn-small" onClick={clearMultiDays}>Wyczyść wybór</button>
+          <button type="button" className="btn btn-small" onClick={selectOnlyToday}>Wybierz tylko dzisiaj</button>
+          <button type="button" className="btn btn-small" onClick={selectWeek}>Wybierz cały tydzień</button>
+        </div>
+        <p className="muted-line">Klucz listy: <strong>multi:{multiSelectionKey}</strong></p>
 
         <div className="selection-summary">
           <strong>Wybrano {selectedDays.length} {selectedDays.length === 1 ? "dzień" : "dni"}:</strong> {selectedDaysLabel}
@@ -278,44 +263,24 @@ export function ShoppingPage() {
           <div className="progress-fill" style={{ width: `${progress}%` }} />
         </div>
 
+        <Link className="btn" to="/magazyn">Otwórz magazyn</Link>
+
         <div className="filter-row shopping-filter-row">
           {FILTERS.map((entry) => (
-            <button key={entry.value} className={filter === entry.value ? "chip active" : "chip"} onClick={() => setFilter(entry.value)}>
+            <button type="button" key={entry.value} className={filter === entry.value ? "chip active" : "chip"} onClick={() => setFilter(entry.value)}>
               {entry.label}
             </button>
           ))}
         </div>
       </section>
 
-      {noSelectedDaysInMultiMode && (
+      {noSelectedDays && (
         <section className="card">
           <div className="empty-state">Wybierz co najmniej jeden dzień, aby zobaczyć listę zakupów.</div>
         </section>
       )}
 
       {showList && missingCount === 0 && totalCount > 0 && <section className="success-state">Wszystkie zakupy dla tej listy są ogarnięte.</section>}
-
-      {showList && (
-      <section className="card">
-        <h3>Brakuje teraz</h3>
-        {missingCount > 0 ? (
-          <ul className="list">
-            {aggregated
-              .filter((item) => item.brakuje)
-              .slice(0, 8)
-              .map((item) => (
-                <li key={item.itemKey} className="list-item">
-                  <strong>{item.nazwa}</strong>
-                  <p>{item.ilosc} {item.jednostka}</p>
-                  <p className="muted-line">Źródło: {item.sourceDayNumbers.map((n) => `D${n}`).join(", ") || "Ręcznie"}</p>
-                </li>
-              ))}
-          </ul>
-        ) : (
-          <div className="empty-state">Brak brakujących pozycji.</div>
-        )}
-      </section>
-      )}
 
       {showList && (filtered.length === 0 ? (
         <section className="card">
@@ -326,7 +291,7 @@ export function ShoppingPage() {
           const isCollapsed = !!collapsed[group.group];
           return (
             <section key={group.group} className="card">
-              <button className="group-header" onClick={() => setCollapsed((prev) => ({ ...prev, [group.group]: !prev[group.group] }))}>
+              <button type="button" className="group-header" onClick={() => setCollapsed((prev) => ({ ...prev, [group.group]: !prev[group.group] }))}>
                 <strong>{group.label}</strong>
                 <span className="badge">{group.items.length}</span>
               </button>
@@ -337,28 +302,23 @@ export function ShoppingPage() {
                     <li key={item.itemKey} className={item.brakuje ? "list-item shopping-missing" : "list-item"}>
                       <div className="item-head">
                         <strong>{item.nazwa}</strong>
-                        <span>{item.ilosc} {item.jednostka}</span>
+                        <span>{item.brakujacaIlosc > 0 ? `Brakuje ${item.brakujacaIlosc} ${item.jednostka}` : "Komplet"}</span>
                       </div>
+                      <p>Potrzeba: {item.ilosc} {item.jednostka}</p>
+                      <p>W magazynie: {item.iloscWMagazynie} {item.jednostka}</p>
                       <p className="muted-line">Źródło: {item.sourceDayNumbers.map((n) => `D${n}`).join(", ") || "Ręcznie"}</p>
                       {item.notatka ? <p>{item.notatka}</p> : null}
 
                       <div className="toggle-row">
-                        <button className={item.kupione ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleState(item.itemKey, "kupione", item.kupione)}>
-                          Kupione
+                        <button type="button" className={item.kupione ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleBought(item)}>
+                          {item.kupione ? "Kupione" : "Kupione + do magazynu"}
                         </button>
-                        <button className={item.mamWDomu ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleState(item.itemKey, "mamWDomu", item.mamWDomu)}>
-                          Mam
+                        <button type="button" className={item.mamWDomu ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => markAsHave(item)}>
+                          {item.mamWDomu ? "Masz w magazynie" : "Ustaw jako mam"}
                         </button>
                       </div>
 
-                      <div className="toggle-row">
-                        <button className={item.wSpizarni ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => togglePantryForItem(item.productKey, item.nazwa, item.wSpizarni)}>
-                          {item.wSpizarni ? "W spiżarni" : "Do spiżarni"}
-                        </button>
-                        <button className="btn btn-small" onClick={() => startEdit(item)}>Edytuj</button>
-                      </div>
-
-                      <button className="btn btn-small" onClick={() => removeFromList(item.itemKey, item.nazwa)}>Usuń z tej listy</button>
+                      <button type="button" className="btn btn-small" onClick={() => removeFromList(item.itemKey, item.nazwa)}>Usuń z tej listy</button>
                     </li>
                   ))}
                 </ul>
@@ -393,78 +353,44 @@ export function ShoppingPage() {
           Notatka
           <input value={customNote} onChange={(e) => setCustomNote(e.target.value)} placeholder="Opcjonalnie" />
         </label>
-        <button className="btn btn-primary" onClick={addCustomItem}>Dodaj do listy</button>
+        <button type="button" className="btn btn-primary" onClick={addCustomItem}>Dodaj do listy</button>
       </section>
       )}
 
-      {showList && editKey && (
-        <section className="card">
-          <h3>Edycja pozycji</h3>
-          <label className="field">
-            Nazwa
-            <input value={editName} onChange={(e) => setEditName(e.target.value)} />
-          </label>
-          <div className="grid grid-2">
-            <label className="field">
-              Ilość
-              <input type="number" value={editQty} onChange={(e) => setEditQty(Number(e.target.value))} />
-            </label>
-            <label className="field">
-              Jednostka
-              <select value={editUnit} onChange={(e) => setEditUnit(e.target.value)}>
-                <option value="g">g</option>
-                <option value="ml">ml</option>
-                <option value="szt.">szt.</option>
-              </select>
-            </label>
-          </div>
-          <label className="field">
-            Notatka
-            <input value={editNote} onChange={(e) => setEditNote(e.target.value)} />
-          </label>
-          <div className="grid grid-2">
-            <button className="btn btn-primary" onClick={saveEdit}>Zapisz</button>
-            <button className="btn" onClick={() => setEditKey("")}>Anuluj</button>
-          </div>
-        </section>
-      )}
+      {buyingItem ? (
+        <div className="modal-overlay" onClick={closeBuyDialog}>
+          <section className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <h3>Oznacz jako kupione</h3>
+            <p><strong>Produkt:</strong> {buyingItem.nazwa}</p>
+            <p><strong>Potrzeba:</strong> {buyingItem.ilosc} {buyingItem.jednostka}</p>
+            <p><strong>W magazynie:</strong> {buyingItem.iloscWMagazynie} {buyingItem.jednostka}</p>
 
-      <section className="card">
-        <h3>Spiżarnia</h3>
-        <p>Produkty aktywne w spiżarni automatycznie nie są traktowane jako braki.</p>
-        {pantryActive.length ? (
-          <ul className="list">
-            {pantryActive.map((item) => (
-              <li key={item.id} className="list-item list-row">
-                <strong>{item.label}</strong>
-                <button className="btn btn-small" onClick={() => setPantryItem(item.productKey, item.label, false).then(load)}>
-                  Usuń
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <div className="empty-state">Lista spiżarni jest pusta.</div>
-        )}
+            <label className="field">
+              Kupiłem
+              <div className="buy-input-row">
+                <input
+                  type="number"
+                  min={buyingItem.jednostka === "szt." ? 1 : 0.01}
+                  step={buyingItem.jednostka === "szt." ? 1 : 0.01}
+                  value={buyQty}
+                  onChange={(e) => {
+                    setBuyQty(Number(e.target.value));
+                    if (buyError) setBuyError("");
+                  }}
+                />
+                <span className="badge">{buyingItem.jednostka}</span>
+              </div>
+            </label>
 
-        <label className="field">
-          Dodaj do spiżarni
-          <input
-            placeholder="Np. Ocet"
-            onKeyDown={(e) => {
-              if (e.key !== "Enter") return;
-              const value = (e.currentTarget.value || "").trim();
-              if (!value) return;
-              const normalized = normalizeProductName(value);
-              setPantryItem(normalized.productKey, normalized.canonicalName, true)
-                .then(load)
-                .finally(() => {
-                  e.currentTarget.value = "";
-                });
-            }}
-          />
-        </label>
-      </section>
+            {buyError ? <p className="error-text">{buyError}</p> : null}
+
+            <div className="toggle-row">
+              <button type="button" className="btn btn-small" onClick={closeBuyDialog}>Anuluj</button>
+              <button type="button" className="btn btn-small btn-primary" onClick={submitBoughtAmount}>Dodaj do magazynu</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

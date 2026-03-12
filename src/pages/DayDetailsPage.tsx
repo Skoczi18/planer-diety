@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
+  addInventoryAmount,
   addDeviationLog,
   getDayLog,
+  getInventoryItems,
   getMealLogsByDate,
-  getPantryItems,
   getShoppingManualItems,
   getShoppingStates,
   removeDeviationLog,
+  setMealPreparedWithInventory,
+  setInventoryAmount,
   saveDayNote,
   saveDayWeight,
   setDayDeviationFlag,
@@ -19,6 +22,7 @@ import { formatDatePL, toISODate } from "../lib/date";
 import { useSelectedDate } from "../lib/dateRoute";
 import { aggregateShoppingItems, buildShoppingListKey } from "../lib/shoppingAggregator";
 import { calculatePostepDnia, getAutoStatusDnia, getDayForDate, statusDniaLabel } from "../lib/execution";
+import { runPrepareMealFlow } from "../lib/mealPreparationFlow";
 import { DzienRealizacjiRecord, RealizacjaPosilkuRecord, TypOdstepstwa } from "../types";
 
 const ODSTEPSTWA: { typ: TypOdstepstwa; label: string }[] = [
@@ -40,6 +44,7 @@ export function DayDetailsPage() {
   const [deviationText, setDeviationText] = useState("");
   const [deviationType, setDeviationType] = useState<TypOdstepstwa>("zamienilem_posilek");
   const [shoppingItems, setShoppingItems] = useState<Array<ReturnType<typeof aggregateShoppingItems>[number]>>([]);
+  const [actionInfo, setActionInfo] = useState("");
 
   const day = dieta.find((d) => d.id === dayId);
   const resolvedDay = settings && !day ? getDayForDate(dieta, settings, selectedDate) : day;
@@ -49,11 +54,11 @@ export function DayDetailsPage() {
   const load = async () => {
     if (!resolvedDay) return;
 
-    const [logs, currentDayLog, shoppingStates, pantryItems, manualRows] = await Promise.all([
+    const [logs, currentDayLog, shoppingStates, inventoryItems, manualRows] = await Promise.all([
       getMealLogsByDate(selectedDate),
       getDayLog(selectedDate),
       getShoppingStates(listKey),
-      getPantryItems(),
+      getInventoryItems(),
       getShoppingManualItems(listKey)
     ]);
 
@@ -61,7 +66,7 @@ export function DayDetailsPage() {
     setDayLog(currentDayLog);
     setNoteDraft(currentDayLog?.notatka ?? "");
     setWeightDraft(typeof currentDayLog?.wagaKg === "number" ? String(currentDayLog.wagaKg) : "");
-    setShoppingItems(aggregateShoppingItems([resolvedDay], listKey, shoppingStates, pantryItems, manualRows));
+    setShoppingItems(aggregateShoppingItems([resolvedDay], listKey, shoppingStates, manualRows, inventoryItems));
   };
 
   useEffect(() => {
@@ -75,13 +80,34 @@ export function DayDetailsPage() {
   const postep = calculatePostepDnia(resolvedDay, mealLogs);
 
   const togglePrepared = async (mealId: string, current: boolean) => {
-    await setMealStatus(selectedDate, resolvedDay.id, resolvedDay.numerDnia, mealId, { przygotowany: !current });
+    const meal = resolvedDay.posilki.find((it) => it.id === mealId);
+    if (!meal) return;
+    if (!current) {
+      const result = await runPrepareMealFlow(selectedDate, resolvedDay, meal);
+      if (result.inventoryDeductionInfo) setActionInfo(result.inventoryDeductionInfo);
+    } else {
+      const log = mealLogs.find((entry) => entry.posilekId === mealId);
+      await setMealPreparedWithInventory(selectedDate, resolvedDay, meal, false);
+      if (log?.inventoryDeducted) {
+        setActionInfo("Składniki zostały już odjęte wcześniej i nie są automatycznie przywracane.");
+      }
+    }
     await load();
   };
 
   const toggleEaten = async (mealId: string, current: boolean) => {
-    await setMealStatus(selectedDate, resolvedDay.id, resolvedDay.numerDnia, mealId, { zjedzony: !current, przygotowany: !current ? true : undefined });
-    await load();
+    const log = mealLogs.find((entry) => entry.posilekId === mealId);
+    if (!current && !log?.przygotowany) {
+      setActionInfo("Najpierw oznacz posiłek jako przygotowany. Bez przygotowania nie można oznaczyć go jako zjedzony.");
+      return;
+    }
+    try {
+      await setMealStatus(selectedDate, resolvedDay.id, resolvedDay.numerDnia, mealId, { zjedzony: !current });
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Nie udało się zaktualizować statusu posiłku.";
+      setActionInfo(message);
+    }
   };
 
   const saveNote = async () => {
@@ -106,8 +132,18 @@ export function DayDetailsPage() {
     await load();
   };
 
-  const toggleShopping = async (itemKey: string, field: "kupione" | "mamWDomu", value: boolean) => {
-    await setShoppingState(listKey, itemKey, { [field]: !value });
+  const toggleShoppingBought = async (item: (typeof shoppingItems)[number]) => {
+    if (!item.kupione) {
+      await addInventoryAmount(item.productKey, item.jednostka, item.ilosc, item.nazwa);
+      await setShoppingState(listKey, item.itemKey, { kupione: true });
+    } else {
+      await setShoppingState(listKey, item.itemKey, { kupione: false });
+    }
+    await load();
+  };
+
+  const markShoppingHave = async (item: (typeof shoppingItems)[number]) => {
+    await setInventoryAmount(item.productKey, item.jednostka, Math.max(item.ilosc, item.iloscWMagazynie), item.nazwa);
     await load();
   };
 
@@ -134,6 +170,12 @@ export function DayDetailsPage() {
         </button>
       </section>
 
+      {actionInfo ? (
+        <section className="card">
+          <p>{actionInfo}</p>
+        </section>
+      ) : null}
+
       <section className="card">
         <h3>Posiłki</h3>
         <ul className="list">
@@ -157,10 +199,17 @@ export function DayDetailsPage() {
                   <button className={prepared ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => togglePrepared(meal.id, prepared)}>
                     {prepared ? "Przygotowany" : "Przygotuj"}
                   </button>
-                  <button className={eaten ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleEaten(meal.id, eaten)}>
+                  <button
+                    className={eaten ? "btn btn-small btn-success" : "btn btn-small"}
+                    onClick={() => toggleEaten(meal.id, eaten)}
+                    disabled={!prepared && !eaten}
+                    title={!prepared && !eaten ? "Najpierw oznacz posiłek jako przygotowany." : undefined}
+                  >
                     {eaten ? "Zjedzony" : "Zjedzono"}
                   </button>
                 </div>
+                {log?.inventoryDeducted ? <p className="muted-line">Składniki odjęte z magazynu.</p> : null}
+                {log?.inventoryDeductionInfo ? <p className="muted-line">{log.inventoryDeductionInfo}</p> : null}
               </li>
             );
           })}
@@ -176,15 +225,17 @@ export function DayDetailsPage() {
               <div className="item-head">
                 <strong>{item.nazwa}</strong>
                 <span>
-                  {item.ilosc} {item.jednostka}
+                  Brakuje: {item.brakujacaIlosc} {item.jednostka}
                 </span>
               </div>
+              <p>Potrzeba: {item.ilosc} {item.jednostka}</p>
+              <p>W magazynie: {item.iloscWMagazynie} {item.jednostka}</p>
               <div className="toggle-row">
-                <button className={item.kupione ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleShopping(item.itemKey, "kupione", item.kupione)}>
-                  Kupione
+                <button className={item.kupione ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleShoppingBought(item)}>
+                  {item.kupione ? "Kupione" : "Kupione + do magazynu"}
                 </button>
-                <button className={item.mamWDomu ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => toggleShopping(item.itemKey, "mamWDomu", item.mamWDomu)}>
-                  Mam
+                <button className={item.mamWDomu ? "btn btn-small btn-success" : "btn btn-small"} onClick={() => markShoppingHave(item)}>
+                  {item.mamWDomu ? "Masz w magazynie" : "Ustaw jako mam"}
                 </button>
               </div>
             </li>

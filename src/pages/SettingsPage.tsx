@@ -132,7 +132,7 @@ export function SettingsPage() {
         <p>Zapis lokalny: IndexedDB</p>
         <p>Szacowany rozmiar danych: {dataSizeKb} KB</p>
         <p>
-          Zarządzanie spiżarnią znajdziesz w sekcji <Link to="/zakupy">Zakupy</Link>.
+          Zarządzanie stanami produktów znajdziesz w sekcjach <Link to="/zakupy">Zakupy</Link> i <Link to="/magazyn">Magazyn</Link>.
         </p>
       </section>
 

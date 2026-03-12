@@ -30,6 +30,7 @@ export function CalendarPage() {
   const [mealLogs, setMealLogs] = useState<RealizacjaPosilkuRecord[]>([]);
   const [anchorMonth, setAnchorMonth] = useState<Date>(startOfMonth(new Date()));
   const [selectedDate, setSelectedDate] = useState(toISODate());
+  const [weekAnchorDate, setWeekAnchorDate] = useState(toISODate());
   const [viewMode, setViewMode] = useState<"miesiac" | "historia">("miesiac");
 
   useEffect(() => {
@@ -97,7 +98,7 @@ export function CalendarPage() {
   );
 
   const weekRangeSnapshots = useMemo(() => {
-    const date = fromIsoLocal(selectedDate);
+    const date = fromIsoLocal(weekAnchorDate);
     const monday = startOfWeek(date, { weekStartsOn: 1 });
     return Array.from({ length: 7 }, (_, idx) => toIsoLocal(addDays(monday, idx))).map((iso) => {
       const cached = snapshotMap.get(iso);
@@ -107,9 +108,9 @@ export function CalendarPage() {
       const dateMeals = mealLogs.filter((entry) => entry.data === iso && (day ? entry.dzienDietyId === day.id || !entry.dzienDietyId : true));
       return buildDaySnapshot(iso, day, dayLog, dateMeals);
     });
-  }, [selectedDate, snapshotMap, settings, dieta, dayLogs, mealLogs]);
+  }, [weekAnchorDate, snapshotMap, settings, dieta, dayLogs, mealLogs]);
 
-  const weekSummary = useMemo(() => buildWeekSummary(selectedDate, weekRangeSnapshots), [selectedDate, weekRangeSnapshots]);
+  const weekSummary = useMemo(() => buildWeekSummary(weekAnchorDate, weekRangeSnapshots), [weekAnchorDate, weekRangeSnapshots]);
   const globalStats = useMemo(() => buildGlobalStats(allSnapshots), [allSnapshots]);
 
   if (!settings || loading) return <p className="empty">Ładowanie kalendarza...</p>;
@@ -147,7 +148,9 @@ export function CalendarPage() {
             selected={fromIsoLocal(selectedDate)}
             onSelect={(date) => {
               if (!date) return;
-              setSelectedDate(toIsoLocal(date));
+              const iso = toIsoLocal(date);
+              setSelectedDate(iso);
+              setWeekAnchorDate(iso);
               setAnchorMonth(startOfMonth(date));
             }}
             month={anchorMonth}
@@ -240,6 +243,24 @@ export function CalendarPage() {
 
       <section className="card">
         <h3>Podsumowanie tygodnia</h3>
+        <div className="quick-day-actions">
+          <button className="btn btn-small" onClick={() => setWeekAnchorDate((prev) => toIsoLocal(addDays(fromIsoLocal(prev), -7)))}>
+            Poprzedni tydzień
+          </button>
+          <button className="btn btn-small" onClick={() => setWeekAnchorDate((prev) => toIsoLocal(addDays(fromIsoLocal(prev), 7)))}>
+            Następny tydzień
+          </button>
+          <button className="btn btn-small" onClick={() => setWeekAnchorDate(toISODate())}>
+            Bieżący tydzień
+          </button>
+          <button className="btn btn-small" onClick={() => setWeekAnchorDate(selectedDate)}>
+            Tydzień wybranej daty
+          </button>
+        </div>
+        <label className="field">
+          Data w tygodniu (zakres liczy się automatycznie pon-niedz)
+          <input type="date" value={weekAnchorDate} onChange={(e) => setWeekAnchorDate(e.target.value)} />
+        </label>
         <p>Zakres: {weekSummary.from} - {weekSummary.to}</p>
         <p>Zrealizowane dni: {weekSummary.zrealizowane}</p>
         <p>Odstępstwa: {weekSummary.odstepstwa}</p>
